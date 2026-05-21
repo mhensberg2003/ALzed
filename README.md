@@ -1,82 +1,154 @@
 # ALzed
 
-AL language support for [Zed](https://zed.dev) — targeting feature parity with the
-Microsoft VS Code AL extension for Dynamics 365 Business Central.
+AL language support for [Zed](https://zed.dev) — Microsoft Dynamics 365
+Business Central development without leaving your editor of choice.
+
+ALzed gives Zed feature parity with the daily inner loop of the official
+VS Code AL extension: highlighting, IntelliSense, diagnostics, symbol
+management, build, publish, run-in-browser, and inline snippets. The
+only thing it doesn't do yet is debug (F5).
 
 ## Status
 
 | Feature | Status |
 |---|---|
-| Syntax highlighting | working (tree-sitter-al) |
-| File association (`.al`, `.dal`) | working |
-| LSP transport (server starts) | working |
-| Diagnostics / IntelliSense / hover / go-to-def | **blocked on protocol bridge** — see below |
-| Symbols / outline | planned |
-| Snippets | planned |
-| Build / publish / debug commands | planned |
+| Syntax highlighting (`.al`, `.dal`) | ✅ |
+| Hover, completion, go-to-definition | ✅ |
+| Diagnostics (errors, warnings, code analyzers) | ✅ |
+| Symbol package download (`al/downloadSymbols`) | ✅ |
+| Symbol package check (`al/checkSymbols`) | ✅ |
+| Build (`al/createPackage`) | ✅ |
+| Publish (`al/fullDependencyPublish`) | ✅ |
+| Run object → BC web client | ✅ |
+| Snippets (`ttable`, `tpage`, `tcodeunit`, ...) | ✅ — 28 hand-authored |
+| Toast feedback on command results | ✅ |
+| `$/progress` notifications for long ops | ✅ |
+| Debug (F5 via DAP) | ⛔ planned |
+| Test runner | ⛔ planned |
 
-## Why the bridge
+## How it works
 
-The Microsoft AL Language Server (`Microsoft.Dynamics.Nav.EditorServices.Host`)
-does **not** speak vanilla LSP for the features that matter. It exposes a
-custom `al/*` protocol — for example, IntelliSense uses `al/completions`
-instead of `textDocument/completion`, and the server is inert until it
-receives an `al/loadManifest` request per workspace folder.
+The Microsoft AL Language Server
+(`Microsoft.Dynamics.Nav.EditorServices.Host.exe`) doesn't speak vanilla
+LSP. It needs a custom `al/loadManifest` + `al/setActiveWorkspace`
+handshake before it'll respond to anything, and most features go through
+custom `al/*` methods rather than standard LSP ones. VS Code's AL
+extension ships a TypeScript shim that translates between the two.
 
-The VS Code AL extension ships a TypeScript shim that performs this
-translation. Zed cannot do it natively, so ALzed includes a small Rust process
-— **`alzed-bridge`** — that sits between Zed and the AL Language Server and
-translates the protocols.
+Zed extensions are sandboxed WASM modules, so they can't run the AL
+server directly. ALzed solves this with a small native Rust binary,
+**`alzed-bridge`**, that sits between Zed and the AL server:
 
-See [docs/al-protocol.md](docs/al-protocol.md) for the custom method inventory
-and translation plan.
+```
+Zed  <--stdio LSP-->  alzed-bridge  <--stdio LSP + al/*-->  AL Language Server
+```
+
+The bridge:
+
+- Performs the AL handshake on workspace open (loadManifest +
+  workspace/didChangeConfiguration + setActiveWorkspace).
+- Normalizes the AL server's quirks (empty `{}` hovers → `null`,
+  string IDs → numeric, etc.).
+- Injects code actions on `.al` files: Download symbols, Check
+  symbols, Build, Publish, Run.
+- Translates `al/progressNotification` → `$/progress`, and wraps each
+  user-facing command in its own progress task so Zed shows a status-bar
+  spinner during the otherwise-silent multi-second operations.
+- Prepends an inline snippet library to every `textDocument/completion`
+  response, so `ttable<Tab>` works out of the box with no user config.
+
+See [`docs/al-protocol.md`](docs/al-protocol.md) for the
+reverse-engineered protocol notes.
 
 ## Repo layout
 
 ```
 ALzed/
 ├── crates/
-│   ├── extension/      Zed extension (compiled to wasm32-wasip2, loaded by Zed)
-│   └── bridge/         alzed-bridge — native binary, runs on the host
+│   ├── extension/       Zed extension (wasm32-wasip2)
+│   │   ├── extension.toml
+│   │   ├── languages/al/{config.toml,highlights.scm}
+│   │   └── src/al.rs    Tells Zed how to launch alzed-bridge
+│   └── bridge/          alzed-bridge — native Rust binary
+│       ├── src/{main.rs,snippets.rs,progress.rs}
+│       └── snippets/al_snippets.json
 ├── docs/
-│   └── al-protocol.md  Reverse-engineered AL custom LSP protocol notes
+│   └── al-protocol.md   Custom al/* protocol notes
 └── README.md
 ```
 
-## Installation (dev)
+## Installation
+
+ALzed has two parts that need to be set up separately: the **Zed
+extension** (loaded as a dev extension) and the **bridge binary**
+(compiled native, runs alongside Zed).
+
+### 1. Prerequisites
+
+- Rust toolchain (`rustup`).
+- `wasm32-wasip2` target: `rustup target add wasm32-wasip2`.
+- The official VS Code AL extension installed — that's how you obtain
+  the MS AL Language Server itself. ALzed does not redistribute it.
+- (Linux/WSL → Windows only) `mingw-w64` for cross-compiling to
+  `x86_64-pc-windows-gnu`: `sudo apt install mingw-w64` and
+  `rustup target add x86_64-pc-windows-gnu`.
+
+### 2. Build the bridge
+
+The bridge needs to be compiled for the OS where Zed runs (where the AL
+server runs is the same OS in practice).
+
+**Windows host, building on Windows:**
 
 ```sh
-git clone https://github.com/mhensberg2003/ALzed.git
-cd ALzed
-rustup target add wasm32-wasip2
-
-# Build the bridge for your host:
 cargo build --release --manifest-path crates/bridge/Cargo.toml
+# → crates/bridge/target/release/alzed-bridge.exe
 ```
 
-Then in Zed: `Ctrl+Shift+P` → **"zed: install dev extension"** → pick
-**`crates/extension`** (not the repo root).
+**Windows host, cross-compiling from WSL/Linux:**
 
-## Configuring the AL Language Server
+```sh
+cd crates/bridge
+cargo build --release --target x86_64-pc-windows-gnu
+# → target/x86_64-pc-windows-gnu/release/alzed-bridge.exe
+```
 
-The MS AL Language Server is closed-source and ships inside the official
-VS Code AL extension (`ms-dynamics-smb.al`). ALzed does not redistribute it.
+**macOS or Linux host (native Zed):**
 
-Typical paths after installing the VS Code AL extension:
+```sh
+cargo build --release --manifest-path crates/bridge/Cargo.toml
+# → crates/bridge/target/release/alzed-bridge
+```
+
+Copy the resulting binary to a stable path (e.g. `~/bin/alzed-bridge`
+or `C:\Users\you\bin\alzed-bridge.exe`) so you can reference it from
+`settings.json`.
+
+### 3. Install the Zed extension
+
+In Zed: `Ctrl+Shift+P` → **"zed: install dev extension"** → pick the
+`crates/extension` directory (not the repo root).
+
+> ⚠️ On Windows, install from a native Windows path
+> (`C:\Users\you\ALzed\crates\extension`). UNC paths like
+> `\\wsl.localhost\Ubuntu\...` cause the dev-extension build to fail.
+
+### 4. Locate the AL Language Server
+
+After installing the VS Code AL extension, the server lives at:
 
 - **Windows**: `%USERPROFILE%\.vscode\extensions\ms-dynamics-smb.al-<version>\bin\win32\Microsoft.Dynamics.Nav.EditorServices.Host.exe`
 - **macOS**: `~/.vscode/extensions/ms-dynamics-smb.al-<version>/bin/darwin/Microsoft.Dynamics.Nav.EditorServices.Host`
 - **Linux**: `~/.vscode/extensions/ms-dynamics-smb.al-<version>/bin/linux/Microsoft.Dynamics.Nav.EditorServices.Host`
 
-In your Zed `settings.json`, point Zed at **`alzed-bridge`** and pass the AL
-server path through it:
+### 5. Wire it together in `settings.json`
 
 ```jsonc
 {
   "lsp": {
     "al": {
       "binary": {
-        "path": "/absolute/path/to/target/release/alzed-bridge",
+        "path": "C:\\Users\\you\\bin\\alzed-bridge.exe",
         "arguments": [
           "--al-server",
           "C:\\Users\\you\\.vscode\\extensions\\ms-dynamics-smb.al-17.0.2273547\\bin\\win32\\Microsoft.Dynamics.Nav.EditorServices.Host.exe"
@@ -84,20 +156,120 @@ server path through it:
       },
       "settings": {
         "packageCachePath": "./.alpackages",
-        "enableCodeAnalysis": true
+        "enableCodeAnalysis": false
       }
     }
   }
 }
 ```
 
-Alternatively set `ALZED_AL_SERVER` in your environment instead of passing
-`--al-server`.
+Or set `ALZED_AL_SERVER` in your environment and drop the
+`--al-server` arg.
 
-To see every LSP frame the bridge handles, set `RUST_LOG=alzed_bridge=trace`.
+## Using ALzed
+
+Open any AL workspace (a folder with an `app.json`). Once Zed connects,
+the bridge runs the AL handshake automatically. Diagnostics should
+appear within seconds.
+
+### Code actions
+
+Press `Ctrl+.` on any `.al` file to surface ALzed's commands:
+
+| Action | What it does |
+|---|---|
+| AL: Download symbols | Pulls symbol packages for all dependencies into `.alpackages/` |
+| AL: Check symbols | Verifies all symbol packages are present and up to date |
+| AL: Build package | Compiles the project into a `.app` file |
+| AL: Publish | Builds + pushes to the BC server in `launch.json` |
+| AL: Run object | Opens the configured `startupObject` in the BC web client |
+
+Every command emits a toast on completion and a `$/progress` spinner
+while running, so you can see what's happening.
+
+### Snippets
+
+Start typing one of these prefixes in a `.al` file:
+
+```
+ttable       tpage         tpagecard     tpageext     tcodeunit
+treport      tquery        txmlport      tenum        tenumext
+tinterface   tprocedure    tlocalproc    tinternalproc
+ttrigger     tif           tcase         tfor         tforeach
+twhile       trepeat       terror        ttest        teventsub
+tfield       tpageaction   tpagefield    ttableext
+```
+
+They appear at the top of the completion menu with tab-stop placeholders.
+
+### `launch.json`
+
+ALzed reads `.vscode/launch.json` for Publish and Run. The first
+configuration in the array is used. Minimal example for a cloud
+sandbox:
+
+```jsonc
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "al",
+      "request": "launch",
+      "name": "Sandbox",
+      "environmentType": "Sandbox",
+      "environmentName": "MyEnv",
+      "tenant": "<tenant-guid>",
+      "startupObjectType": "Page",
+      "startupObjectId": 50100,
+      "startupCompany": "CRONUS USA, Inc."
+    }
+  ]
+}
+```
+
+## Troubleshooting
+
+### Nothing happens / no diagnostics
+
+Open Zed's LSP log (`Ctrl+Shift+P` → "zed: open lsp logs") and look for
+`alzed-bridge` output. Useful environment variables for the bridge:
+
+- `RUST_LOG=alzed_bridge=debug` — handshake details.
+- `RUST_LOG=alzed_bridge=trace` — every LSP frame.
+
+Set them via the `env` field in `settings.json` under the `al` language
+server entry.
+
+### `alzed-bridge.exe` is locked when redeploying
+
+Zed sometimes leaves `alzed-bridge.exe` and one or more
+`Microsoft.Dynamics.Nav.EditorServices.Host.exe` processes running
+after closing. If `cp` / `Move-Item` can't overwrite the bridge on
+update, kill the stale processes:
+
+```powershell
+taskkill /F /IM alzed-bridge.exe
+taskkill /F /IM Microsoft.Dynamics.Nav.EditorServices.Host.exe
+```
+
+### Symbol download hangs
+
+The MS AL server downloads symbols from BC's package feed; this takes
+~30 s for a fresh project (≈100 MB of symbol packages). The
+`$/progress` spinner in Zed's status bar should be active the whole
+time. If it never finishes, check `RUST_LOG=alzed_bridge=debug` for
+auth errors from the feed.
+
+### Run object opens the wrong URL
+
+ALzed builds the URL from `launch.json`'s `startupObjectType`,
+`startupObjectId`, `environmentType`, `environmentName`, `server`,
+`serverInstance`, `tenant`, and `startupCompany`. Double-check these
+match what you'd configure in VS Code.
 
 ## License
 
-MIT. The tree-sitter grammar is MIT-licensed by its author. The Microsoft AL
-Language Server is proprietary and is **not** redistributed — users must obtain
-it via the official VS Code AL extension.
+MIT (see [LICENSE](LICENSE)). The tree-sitter grammar is MIT-licensed by
+its author. The bundled snippets are hand-authored for this project.
+The Microsoft AL Language Server is proprietary and is **not**
+redistributed — users obtain it via the official VS Code AL extension.
