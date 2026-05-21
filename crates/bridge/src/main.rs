@@ -612,19 +612,40 @@ async fn maybe_normalize_hover(
 
 const CMD_DOWNLOAD_SYMBOLS: &str = "alzed.al.downloadSymbols";
 const CMD_CHECK_SYMBOLS: &str = "alzed.al.checkSymbols";
-const OUR_COMMANDS: [&str; 2] = [CMD_DOWNLOAD_SYMBOLS, CMD_CHECK_SYMBOLS];
+const CMD_BUILD: &str = "alzed.al.build";
+const CMD_PUBLISH: &str = "alzed.al.publish";
+const OUR_COMMANDS: [&str; 4] = [
+    CMD_DOWNLOAD_SYMBOLS,
+    CMD_CHECK_SYMBOLS,
+    CMD_BUILD,
+    CMD_PUBLISH,
+];
+
+/// Version string we report to the AL server in createPackage /
+/// fullDependencyPublish requests. The MS server uses this as the VS Code
+/// extension version (some compiler behavior gates on this). We send a
+/// high-enough fake to avoid version-gate refusals.
+const REPORTED_EXTENSION_VERSION: &str = "17.0.2273547";
 
 /// AL request methods whose responses should be surfaced to the user via
 /// `window/showMessage`. Background handshake methods (al/loadManifest,
 /// al/setActiveWorkspace) are excluded — they're noise from the user's POV.
 fn is_user_facing_command(method: &str) -> bool {
-    matches!(method, "al/downloadSymbols" | "al/checkSymbols")
+    matches!(
+        method,
+        "al/downloadSymbols"
+            | "al/checkSymbols"
+            | "al/createPackage"
+            | "al/fullDependencyPublish"
+    )
 }
 
 fn command_label(method: &str) -> &'static str {
     match method {
         "al/downloadSymbols" => "Download symbols",
         "al/checkSymbols" => "Check symbols",
+        "al/createPackage" => "Build package",
+        "al/fullDependencyPublish" => "Publish",
         _ => "command",
     }
 }
@@ -821,10 +842,27 @@ fn inject_code_actions(v: &Value, original: &[u8], uri: Option<&str>) -> Result<
         json!({
             "title": "AL: Check symbols",
             "kind": "refactor",
-            "isPreferred": true,
             "command": {
                 "title": "AL: Check symbols",
                 "command": CMD_CHECK_SYMBOLS,
+                "arguments": [{ "uri": uri }],
+            }
+        }),
+        json!({
+            "title": "AL: Build package",
+            "kind": "refactor",
+            "command": {
+                "title": "AL: Build package",
+                "command": CMD_BUILD,
+                "arguments": [{ "uri": uri }],
+            }
+        }),
+        json!({
+            "title": "AL: Publish",
+            "kind": "refactor",
+            "command": {
+                "title": "AL: Publish",
+                "command": CMD_PUBLISH,
                 "arguments": [{ "uri": uri }],
             }
         }),
@@ -892,6 +930,14 @@ async fn handle_our_command(
             None => Err(anyhow!("no workspace folder resolved for downloadSymbols")),
         },
         CMD_CHECK_SYMBOLS => trigger_check_symbols(session, _to_server).await,
+        CMD_BUILD => match folder.as_deref() {
+            Some(f) => trigger_build(f, session, _to_server).await,
+            None => Err(anyhow!("no workspace folder resolved for build")),
+        },
+        CMD_PUBLISH => match folder.as_deref() {
+            Some(f) => trigger_publish(f, session, _to_server).await,
+            None => Err(anyhow!("no workspace folder resolved for publish")),
+        },
         _ => Ok(()),
     };
     if let Err(e) = result {
@@ -977,6 +1023,99 @@ async fn trigger_check_symbols(
         "params": {}
     });
     info!(id, "sending al/checkSymbols");
+    to_server.send(frame(&serde_json::to_vec(&request)?)).await?;
+    Ok(())
+}
+
+/// Default compiler arg list — only the mandatory `-project:"..."` for now.
+/// Future enhancement: read AL settings (codeAnalyzers, ruleSetPath,
+/// packageCachePaths, ...) and translate into `-analyzer:`, `-ruleset:`,
+/// `-packagecachepath:` arguments.
+fn default_compiler_args(project_dir: &str) -> Vec<String> {
+    vec![format!("-project:\"{project_dir}\"")]
+}
+
+/// Build (createPackage) — compiles the AL project into a `.app` package.
+/// Params shape mirrors VS Code AL extension's `performBuild`:
+///   {projectDir, args, isRad, vSCodeExtensionVersion, forceBuildDependencies}
+/// Note: this request goes straight to languageServerClient.sendRequest in
+/// VS Code — no `configuration:` wrapping (unlike downloadSymbols).
+async fn trigger_build(
+    folder: &std::path::Path,
+    session: &Arc<Mutex<Session>>,
+    to_server: &mpsc::Sender<Vec<u8>>,
+) -> Result<()> {
+    let project_dir = folder.to_string_lossy().into_owned();
+    let args = default_compiler_args(&project_dir);
+
+    let params = json!({
+        "projectDir": project_dir,
+        "args": args,
+        "isRad": false,
+        "vSCodeExtensionVersion": REPORTED_EXTENSION_VERSION,
+        "forceBuildDependencies": false,
+    });
+
+    let id = session.lock().await.alloc_id("al/createPackage");
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "al/createPackage",
+        "params": params,
+    });
+    info!(project = %folder.display(), id, "sending al/createPackage");
+    to_server.send(frame(&serde_json::to_vec(&request)?)).await?;
+    Ok(())
+}
+
+/// Publish (fullDependencyPublish) — builds the project and pushes the
+/// resulting `.app` to the Business Central server configured in launch.json.
+/// Params shape from VS Code AL extension's `sendFullDependencyPublishRequest`:
+///   serverProxy.sendRequest(launchConfig, FullDependencyPublishRequest,
+///       {ProjectDir, args, vSCodeExtensionVersion})
+/// The serverProxy wrapper merges these as `Object.assign({configuration: launchConfig}, params)`.
+/// Note the capital `ProjectDir` — that's how the C# server expects it.
+async fn trigger_publish(
+    folder: &std::path::Path,
+    session: &Arc<Mutex<Session>>,
+    to_server: &mpsc::Sender<Vec<u8>>,
+) -> Result<()> {
+    let launch_path = folder.join(".vscode").join("launch.json");
+    let launch_text = tokio::fs::read_to_string(&launch_path)
+        .await
+        .with_context(|| format!("reading {}", launch_path.display()))?;
+    let launch: Value = parse_jsonc(&launch_text)
+        .with_context(|| format!("parsing {}", launch_path.display()))?;
+    let config = launch
+        .get("configurations")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .cloned()
+        .ok_or_else(|| anyhow!("launch.json has no configurations[]"))?;
+
+    let project_dir = folder.to_string_lossy().into_owned();
+    let args = default_compiler_args(&project_dir);
+
+    let params = json!({
+        "configuration": config,
+        "ProjectDir": project_dir,
+        "args": args,
+        "vSCodeExtensionVersion": REPORTED_EXTENSION_VERSION,
+    });
+
+    let id = session.lock().await.alloc_id("al/fullDependencyPublish");
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "al/fullDependencyPublish",
+        "params": params,
+    });
+    info!(
+        project = %folder.display(),
+        config_name = config.get("name").and_then(|n| n.as_str()).unwrap_or("?"),
+        id,
+        "sending al/fullDependencyPublish"
+    );
     to_server.send(frame(&serde_json::to_vec(&request)?)).await?;
     Ok(())
 }
