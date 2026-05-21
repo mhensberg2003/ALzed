@@ -20,6 +20,8 @@
 //!
 //! See `docs/al-protocol.md` for protocol details.
 
+mod snippets;
+
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -605,6 +607,10 @@ async fn maybe_normalize_hover(
         }
         "textDocument/codeLens" => {
             Ok((true, inject_code_lenses(v, original, uri.as_deref())?))
+        }
+        "textDocument/completion" => {
+            let patched = snippets::inject_into_completion(v);
+            Ok((true, serde_json::to_vec(&patched)?))
         }
         _ => Ok((true, original.to_vec())),
     }

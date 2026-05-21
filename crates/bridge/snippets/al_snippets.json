@@ -1,0 +1,422 @@
+{
+  "AL Table": {
+    "prefix": "ttable",
+    "description": "Scaffold a new AL table object",
+    "body": [
+      "table ${1:50100} \"${2:My Table}\"",
+      "{",
+      "\tCaption = '${2:My Table}';",
+      "\tDataClassification = CustomerContent;",
+      "",
+      "\tfields",
+      "\t{",
+      "\t\tfield(1; \"${3:No.}\"; Code[20])",
+      "\t\t{",
+      "\t\t\tCaption = '${3:No.}';",
+      "\t\t}",
+      "\t\t$0",
+      "\t}",
+      "",
+      "\tkeys",
+      "\t{",
+      "\t\tkey(PK; \"${3:No.}\")",
+      "\t\t{",
+      "\t\t\tClustered = true;",
+      "\t\t}",
+      "\t}",
+      "}"
+    ]
+  },
+  "AL Table Extension": {
+    "prefix": "ttableext",
+    "description": "Scaffold a tableextension",
+    "body": [
+      "tableextension ${1:50100} \"${2:My Table Ext}\" extends \"${3:Customer}\"",
+      "{",
+      "\tfields",
+      "\t{",
+      "\t\tfield(${4:50100}; \"${5:My Field}\"; ${6:Text[50]})",
+      "\t\t{",
+      "\t\t\tCaption = '${5:My Field}';",
+      "\t\t\tDataClassification = CustomerContent;",
+      "\t\t}",
+      "\t\t$0",
+      "\t}",
+      "}"
+    ]
+  },
+  "AL Page (List)": {
+    "prefix": "tpage",
+    "description": "Scaffold a List page",
+    "body": [
+      "page ${1:50100} \"${2:My List}\"",
+      "{",
+      "\tPageType = List;",
+      "\tCaption = '${2:My List}';",
+      "\tApplicationArea = All;",
+      "\tUsageCategory = Lists;",
+      "\tSourceTable = \"${3:My Table}\";",
+      "",
+      "\tlayout",
+      "\t{",
+      "\t\tarea(Content)",
+      "\t\t{",
+      "\t\t\trepeater(Group)",
+      "\t\t\t{",
+      "\t\t\t\tfield(\"${4:No.}\"; Rec.\"${4:No.}\")",
+      "\t\t\t\t{",
+      "\t\t\t\t\tApplicationArea = All;",
+      "\t\t\t\t}",
+      "\t\t\t\t$0",
+      "\t\t\t}",
+      "\t\t}",
+      "\t}",
+      "}"
+    ]
+  },
+  "AL Page (Card)": {
+    "prefix": "tpagecard",
+    "description": "Scaffold a Card page",
+    "body": [
+      "page ${1:50101} \"${2:My Card}\"",
+      "{",
+      "\tPageType = Card;",
+      "\tCaption = '${2:My Card}';",
+      "\tApplicationArea = All;",
+      "\tUsageCategory = Documents;",
+      "\tSourceTable = \"${3:My Table}\";",
+      "",
+      "\tlayout",
+      "\t{",
+      "\t\tarea(Content)",
+      "\t\t{",
+      "\t\t\tgroup(General)",
+      "\t\t\t{",
+      "\t\t\t\tfield(\"${4:No.}\"; Rec.\"${4:No.}\")",
+      "\t\t\t\t{",
+      "\t\t\t\t\tApplicationArea = All;",
+      "\t\t\t\t}",
+      "\t\t\t\t$0",
+      "\t\t\t}",
+      "\t\t}",
+      "\t}",
+      "}"
+    ]
+  },
+  "AL Page Extension": {
+    "prefix": "tpageext",
+    "description": "Scaffold a pageextension",
+    "body": [
+      "pageextension ${1:50100} \"${2:My Page Ext}\" extends \"${3:Customer Card}\"",
+      "{",
+      "\tlayout",
+      "\t{",
+      "\t\taddafter(\"${4:Name}\")",
+      "\t\t{",
+      "\t\t\tfield(\"${5:My Field}\"; Rec.\"${5:My Field}\")",
+      "\t\t\t{",
+      "\t\t\t\tApplicationArea = All;",
+      "\t\t\t}",
+      "\t\t\t$0",
+      "\t\t}",
+      "\t}",
+      "",
+      "\tactions",
+      "\t{",
+      "\t}",
+      "}"
+    ]
+  },
+  "AL Codeunit": {
+    "prefix": "tcodeunit",
+    "description": "Scaffold a codeunit",
+    "body": [
+      "codeunit ${1:50100} \"${2:My Codeunit}\"",
+      "{",
+      "\ttrigger OnRun()",
+      "\tbegin",
+      "\t\t$0",
+      "\tend;",
+      "}"
+    ]
+  },
+  "AL Report": {
+    "prefix": "treport",
+    "description": "Scaffold a basic report",
+    "body": [
+      "report ${1:50100} \"${2:My Report}\"",
+      "{",
+      "\tApplicationArea = All;",
+      "\tCaption = '${2:My Report}';",
+      "\tUsageCategory = ReportsAndAnalysis;",
+      "\tDefaultLayout = RDLC;",
+      "\tRDLCLayout = '${3:./layouts/MyReport.rdl}';",
+      "",
+      "\tdataset",
+      "\t{",
+      "\t\tdataitem(${4:Customer}; ${4:Customer})",
+      "\t\t{",
+      "\t\t\tcolumn(${5:Name}; ${5:Name}) { }",
+      "\t\t\t$0",
+      "\t\t}",
+      "\t}",
+      "}"
+    ]
+  },
+  "AL Query": {
+    "prefix": "tquery",
+    "description": "Scaffold a query",
+    "body": [
+      "query ${1:50100} \"${2:My Query}\"",
+      "{",
+      "\tQueryType = Normal;",
+      "",
+      "\telements",
+      "\t{",
+      "\t\tdataitem(${3:Cust}; ${4:Customer})",
+      "\t\t{",
+      "\t\t\tcolumn(${5:Name}; ${5:Name}) { }",
+      "\t\t\t$0",
+      "\t\t}",
+      "\t}",
+      "}"
+    ]
+  },
+  "AL XMLPort": {
+    "prefix": "txmlport",
+    "description": "Scaffold an xmlport",
+    "body": [
+      "xmlport ${1:50100} \"${2:My XMLPort}\"",
+      "{",
+      "\tDirection = Both;",
+      "\tFormat = Xml;",
+      "",
+      "\tschema",
+      "\t{",
+      "\t\ttextelement(Root)",
+      "\t\t{",
+      "\t\t\ttableelement(${3:Customer}; ${3:Customer})",
+      "\t\t\t{",
+      "\t\t\t\tfieldelement(${4:Name}; ${3:Customer}.${4:Name}) { }",
+      "\t\t\t\t$0",
+      "\t\t\t}",
+      "\t\t}",
+      "\t}",
+      "}"
+    ]
+  },
+  "AL Enum": {
+    "prefix": "tenum",
+    "description": "Scaffold an enum",
+    "body": [
+      "enum ${1:50100} \"${2:My Enum}\"",
+      "{",
+      "\tExtensible = ${3|true,false|};",
+      "",
+      "\tvalue(0; ${4:None}) { Caption = '${4:None}'; }",
+      "\tvalue(1; ${5:First}) { Caption = '${5:First}'; }",
+      "\t$0",
+      "}"
+    ]
+  },
+  "AL Enum Extension": {
+    "prefix": "tenumext",
+    "description": "Scaffold an enumextension",
+    "body": [
+      "enumextension ${1:50100} \"${2:My Enum Ext}\" extends \"${3:My Enum}\"",
+      "{",
+      "\tvalue(${4:10}; ${5:NewValue}) { Caption = '${5:NewValue}'; }",
+      "\t$0",
+      "}"
+    ]
+  },
+  "AL Interface": {
+    "prefix": "tinterface",
+    "description": "Scaffold an interface",
+    "body": [
+      "interface \"${1:My Interface}\"",
+      "{",
+      "\tprocedure ${2:DoSomething}(${3});",
+      "\t$0",
+      "}"
+    ]
+  },
+  "AL Procedure": {
+    "prefix": "tprocedure",
+    "description": "A public procedure",
+    "body": [
+      "procedure ${1:DoSomething}(${2})",
+      "var",
+      "\t${3:i}: ${4:Integer};",
+      "begin",
+      "\t$0",
+      "end;"
+    ]
+  },
+  "AL Local Procedure": {
+    "prefix": "tlocalproc",
+    "description": "A local (file-private) procedure",
+    "body": [
+      "local procedure ${1:DoSomething}(${2})",
+      "begin",
+      "\t$0",
+      "end;"
+    ]
+  },
+  "AL Internal Procedure": {
+    "prefix": "tinternalproc",
+    "description": "An internal (extension-private) procedure",
+    "body": [
+      "internal procedure ${1:DoSomething}(${2})",
+      "begin",
+      "\t$0",
+      "end;"
+    ]
+  },
+  "AL Trigger": {
+    "prefix": "ttrigger",
+    "description": "A named trigger",
+    "body": [
+      "trigger ${1|OnRun,OnInsert,OnModify,OnDelete,OnValidate,OnLookup,OnOpenPage,OnAfterGetRecord|}()",
+      "begin",
+      "\t$0",
+      "end;"
+    ]
+  },
+  "AL If/Then": {
+    "prefix": "tif",
+    "description": "if/then/else block",
+    "body": [
+      "if ${1:condition} then",
+      "\t${2:exit}",
+      "else",
+      "\t$0;"
+    ]
+  },
+  "AL Case Statement": {
+    "prefix": "tcase",
+    "description": "case/of/else block",
+    "body": [
+      "case ${1:value} of",
+      "\t${2:'A'}:",
+      "\t\t${3:DoSomething()};",
+      "\t${4:'B'}:",
+      "\t\t${5:DoOther()};",
+      "\telse",
+      "\t\t$0",
+      "end;"
+    ]
+  },
+  "AL For Loop": {
+    "prefix": "tfor",
+    "description": "Numeric for loop",
+    "body": [
+      "for ${1:i} := ${2:1} to ${3:Count} do begin",
+      "\t$0",
+      "end;"
+    ]
+  },
+  "AL Foreach Loop": {
+    "prefix": "tforeach",
+    "description": "foreach over a list",
+    "body": [
+      "foreach ${1:item} in ${2:list} do begin",
+      "\t$0",
+      "end;"
+    ]
+  },
+  "AL While Loop": {
+    "prefix": "twhile",
+    "description": "while loop",
+    "body": [
+      "while ${1:condition} do begin",
+      "\t$0",
+      "end;"
+    ]
+  },
+  "AL Repeat / Until": {
+    "prefix": "trepeat",
+    "description": "repeat/until over a record set",
+    "body": [
+      "${1:Rec}.FindSet();",
+      "repeat",
+      "\t$0",
+      "until ${1:Rec}.Next() = 0;"
+    ]
+  },
+  "AL Error": {
+    "prefix": "terror",
+    "description": "Raise an Error with a label",
+    "body": [
+      "Error('${1:Something went wrong}: %1', ${2:Value});"
+    ]
+  },
+  "AL TestFunction (Codeunit)": {
+    "prefix": "ttest",
+    "description": "A [Test] procedure inside a test codeunit",
+    "body": [
+      "[Test]",
+      "procedure ${1:GivenA_WhenB_ThenC}()",
+      "var",
+      "\t${2:Subject}: Record \"${3:Customer}\";",
+      "begin",
+      "\t// [GIVEN] ${4:setup}",
+      "\t$0",
+      "\t// [WHEN] ${5:action}",
+      "",
+      "\t// [THEN] ${6:assertion}",
+      "end;"
+    ]
+  },
+  "AL EventSubscriber": {
+    "prefix": "teventsub",
+    "description": "An EventSubscriber attribute + procedure",
+    "body": [
+      "[EventSubscriber(ObjectType::${1|Codeunit,Table,Page,Report|}, ${2:Codeunit::\"Codeunit Name\"}, '${3:OnSomeEvent}', '${4:}', false, false)]",
+      "local procedure ${5:OnSomeEvent}(${6})",
+      "begin",
+      "\t$0",
+      "end;"
+    ]
+  },
+  "AL Field (in table)": {
+    "prefix": "tfield",
+    "description": "A field declaration inside a table or tableextension",
+    "body": [
+      "field(${1:10}; \"${2:My Field}\"; ${3:Text[50]})",
+      "{",
+      "\tCaption = '${2:My Field}';",
+      "\tDataClassification = CustomerContent;",
+      "\t$0",
+      "}"
+    ]
+  },
+  "AL Page Action": {
+    "prefix": "tpageaction",
+    "description": "An action entry on a page",
+    "body": [
+      "action(\"${1:My Action}\")",
+      "{",
+      "\tApplicationArea = All;",
+      "\tCaption = '${1:My Action}';",
+      "\tImage = ${2:Action};",
+      "",
+      "\ttrigger OnAction()",
+      "\tbegin",
+      "\t\t$0",
+      "\tend;",
+      "}"
+    ]
+  },
+  "AL Page Field": {
+    "prefix": "tpagefield",
+    "description": "A field entry on a page",
+    "body": [
+      "field(\"${1:My Field}\"; Rec.\"${1:My Field}\")",
+      "{",
+      "\tApplicationArea = All;",
+      "\t$0",
+      "}"
+    ]
+  }
+}
