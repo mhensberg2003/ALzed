@@ -268,9 +268,9 @@ fn is_method_value(v: &Value, method: &str) -> bool {
 }
 
 /// Zed wraps LSP settings under the language-server id (`{settings:{al:{...}}}`),
-/// but the MS AL server expects settings flat under `settings`. Unwrap the
-/// `al` namespace and merge in our defaults so the very first config the
-/// server sees is well-formed.
+/// but the MS AL server expects a specific structured object — see
+/// [`build_al_settings`]. Unwrap the `al` namespace, apply user overrides to
+/// the AL config sub-object, and emit the proper shape.
 async fn rewrite_did_change_configuration(v: &Value, session: &Arc<Mutex<Session>>) -> Vec<u8> {
     let user_al = v
         .get("params")
@@ -280,42 +280,91 @@ async fn rewrite_did_change_configuration(v: &Value, session: &Arc<Mutex<Session
         .unwrap_or_else(|| json!({}));
 
     let folders = session.lock().await.workspace_folders.clone();
-    let default_package_cache_path = folders
+    let project_path = folders
         .first()
         .and_then(|f| uri_to_path(&f.uri))
-        .map(|p| p.join(".alpackages").to_string_lossy().into_owned())
-        .unwrap_or_else(|| "./.alpackages".to_string());
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
 
-    let mut merged = default_al_settings(&default_package_cache_path);
-    if let Value::Object(user_map) = user_al {
-        if let Value::Object(merged_map) = &mut merged {
-            for (k, v) in user_map {
-                merged_map.insert(k, v);
-            }
-        }
-    }
+    let settings = build_al_settings(&project_path, &user_al);
 
     let rewritten = json!({
         "jsonrpc": "2.0",
         "method": "workspace/didChangeConfiguration",
-        "params": { "settings": merged }
+        "params": { "settings": settings }
     });
 
-    debug!(target: "alzed_bridge", "rewrote workspace/didChangeConfiguration: unwrapped al namespace and merged defaults");
+    debug!(target: "alzed_bridge", "rewrote workspace/didChangeConfiguration into MS settings shape");
     serde_json::to_vec(&rewritten).expect("rewrite serialization must succeed")
 }
 
-fn default_al_settings(package_cache_path: &str) -> Value {
+/// Build the settings object the MS AL server expects, structured per the
+/// VS Code AL extension's `getWorkspaceSettings()` output:
+///
+/// ```text
+/// {
+///   workspacePath: <abs path to project folder>,
+///   alResourceConfigurationSettings: {
+///     packageCachePaths: [...],
+///     codeAnalyzers: [...],
+///     enableCodeAnalysis, backgroundCodeAnalysis, ruleSetPath,
+///     incrementalBuild, assemblyProbingPaths, ...
+///   },
+///   setActiveWorkspace: true,
+///   dependencyParentWorkspacePath: null,
+///   expectedProjectReferenceDefinitions: [],
+///   activeWorkspaceClosure: []
+/// }
+/// ```
+///
+/// `user_overrides` is the flat `al.*` config the user put in Zed's settings
+/// (e.g. `{packageCachePath, codeAnalyzers, enableCodeAnalysis}`). Each known
+/// key maps into `alResourceConfigurationSettings`.
+fn build_al_settings(project_path: &str, user_overrides: &Value) -> Value {
+    let default_package_cache = if project_path.is_empty() {
+        ".alpackages".to_string()
+    } else {
+        format!("{project_path}{}{}", std::path::MAIN_SEPARATOR, ".alpackages")
+    };
+
+    let overrides = user_overrides.as_object();
+
+    // packageCachePaths is plural array. Accept singular string from user.
+    let package_cache_paths = match overrides.and_then(|o| o.get("packageCachePath")) {
+        Some(Value::String(s)) => json!([s]),
+        Some(Value::Array(a)) => Value::Array(a.clone()),
+        _ => json!([default_package_cache]),
+    };
+
+    let pick = |key: &str, default: Value| -> Value {
+        overrides
+            .and_then(|o| o.get(key))
+            .cloned()
+            .unwrap_or(default)
+    };
+
+    let al_resource = json!({
+        "assemblyProbingPaths": pick("assemblyProbingPaths", json!(["./.netpackages"])),
+        "codeAnalyzers": pick("codeAnalyzers", json!([])),
+        "enableCodeAnalysis": pick("enableCodeAnalysis", json!(false)),
+        "backgroundCodeAnalysis": pick("backgroundCodeAnalysis", json!("Project")),
+        "packageCachePaths": package_cache_paths,
+        "ruleSetPath": pick("ruleSetPath", json!("")),
+        "enableCodeActions": pick("enableCodeActions", json!(true)),
+        "incrementalBuild": pick("incrementalBuild", json!(false)),
+        "enableCodeLensExternalUsage": pick("enableCodeLensExternalUsage", json!(false)),
+        "outputAnalyzerStatistics": pick("outputAnalyzerStatistics", json!(false)),
+        "enableExternalRulesets": pick("enableExternalRulesets", json!(false)),
+        "namespaceTemplate": pick("namespaceTemplate", json!("")),
+    });
+
     json!({
-        "packageCachePath": package_cache_path,
-        "enableCodeAnalysis": false,
-        "backgroundCodeAnalysis": "Project",
-        "codeAnalyzers": [],
-        "ruleSetPath": "",
-        "incrementalBuild": false,
-        "assemblyProbingPaths": ["./.netpackages"],
-        "dependencyClosure": [],
-        "projectReferences": []
+        "workspacePath": project_path,
+        "alResourceConfigurationSettings": al_resource,
+        "setActiveWorkspace": true,
+        "dependencyParentWorkspacePath": Value::Null,
+        "expectedProjectReferenceDefinitions": [],
+        "activeWorkspaceClosure": [],
     })
 }
 
@@ -537,14 +586,10 @@ async fn run_handshake(
         let body = serde_json::to_vec(&request)?;
         to_server.send(frame(&body)).await?;
 
-        // 1) workspace/didChangeConfiguration (flat) — give the server its
-        //    AL settings. Belt and braces alongside the client-pump's
-        //    rewriting of Zed's automatic config push.
-        let package_cache_path = project_path
-            .join(".alpackages")
-            .to_string_lossy()
-            .into_owned();
-        let settings = default_al_settings(&package_cache_path);
+        // 1) workspace/didChangeConfiguration — give the server its AL
+        //    workspace settings in the structured shape it expects.
+        let project_path_str = project_path.to_string_lossy().into_owned();
+        let settings = build_al_settings(&project_path_str, &json!({}));
 
         let notification = json!({
             "jsonrpc": "2.0",
@@ -553,26 +598,23 @@ async fn run_handshake(
         });
         info!(
             project = %project_path.display(),
-            "sending workspace/didChangeConfiguration (flat settings)"
+            "sending workspace/didChangeConfiguration (structured AL settings)"
         );
         to_server
             .send(frame(&serde_json::to_vec(&notification)?))
             .await?;
 
-        // 2) al/setActiveWorkspace — THE trigger that makes the AL server
-        //    actually start analyzing. The VS Code extension calls this for
-        //    the active workspace folder right after loading the manifest;
-        //    without it, the server stays idle and every editor request
-        //    returns empty. The server expects currentWorkspaceFolderPath
-        //    as a STRING path despite the field's object-y name (it builds
-        //    a DirectoryInfo from it).
+        // 2) al/setActiveWorkspace — the trigger that makes the AL server
+        //    actually start analyzing. The C# handler reads
+        //    settings.workspacePath to build a DirectoryInfo and start
+        //    project analysis. Without this call, the server stays idle.
         let active_id = session.lock().await.alloc_id("al/setActiveWorkspace");
         let active_request = json!({
             "jsonrpc": "2.0",
             "id": active_id,
             "method": "al/setActiveWorkspace",
             "params": {
-                "currentWorkspaceFolderPath": project_path.to_string_lossy(),
+                "currentWorkspaceFolderPath": project_path_str,
                 "settings": settings,
             }
         });
