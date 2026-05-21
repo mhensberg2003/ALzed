@@ -661,14 +661,15 @@ fn inject_app_json_diagnostic(v: &Value) -> Value {
     let hint = json!({
         "range": {
             "start": {"line": 0, "character": 0},
-            "end":   {"line": 0, "character": 0},
+            "end":   {"line": 0, "character": 80},
         },
-        "severity": 3,
+        "severity": 2,
         "source": "alzed",
         "code": "AL_SYMBOLS",
         "message": "AL: symbol management — open any .al file and press Ctrl+. to download or check symbols.",
     });
     arr.insert(0, hint);
+    debug!(target: "alzed_bridge", "injected hint diagnostic on app.json");
     patched
 }
 
@@ -751,7 +752,7 @@ fn inject_code_actions(v: &Value, original: &[u8], uri: Option<&str>) -> Result<
     let mut injected = vec![
         json!({
             "title": "AL: Download symbols",
-            "kind": "source",
+            "isPreferred": true,
             "command": {
                 "title": "AL: Download symbols",
                 "command": CMD_DOWNLOAD_SYMBOLS,
@@ -760,7 +761,7 @@ fn inject_code_actions(v: &Value, original: &[u8], uri: Option<&str>) -> Result<
         }),
         json!({
             "title": "AL: Check symbols",
-            "kind": "source",
+            "isPreferred": true,
             "command": {
                 "title": "AL: Check symbols",
                 "command": CMD_CHECK_SYMBOLS,
