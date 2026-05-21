@@ -36,7 +36,9 @@ jobs:
             artifact_name: alzed-bridge-macos-arm64
             binary: alzed-bridge
             ext: ""
-          - os: macos-13
+          # Intel macOS — cross-compiled from the arm64 runner (Xcode ships
+          # both toolchains). GitHub deprecated the macos-13 Intel runner.
+          - os: macos-latest
             target: x86_64-apple-darwin
             target_name: macos-x86_64
             artifact_name: alzed-bridge-macos-x86_64
