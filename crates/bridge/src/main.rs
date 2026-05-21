@@ -526,10 +526,187 @@ async fn maybe_normalize_hover(
 
 fn spawn_handshake(session: Arc<Mutex<Session>>, to_server: mpsc::Sender<Vec<u8>>) {
     tokio::spawn(async move {
-        if let Err(e) = run_handshake(session, to_server).await {
+        if let Err(e) = run_handshake(session.clone(), to_server.clone()).await {
             error!(error = %e, "AL handshake failed");
         }
+        // After handshake, start the trigger-file watcher so users can invoke
+        // commands like download-symbols from outside Zed.
+        spawn_trigger_watcher(session, to_server);
     });
+}
+
+fn spawn_trigger_watcher(session: Arc<Mutex<Session>>, to_server: mpsc::Sender<Vec<u8>>) {
+    tokio::spawn(async move {
+        let folders = session.lock().await.workspace_folders.clone();
+        let paths: Vec<PathBuf> = folders
+            .iter()
+            .filter_map(|f| uri_to_path(&f.uri))
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        info!(
+            count = paths.len(),
+            "watching for .alzed-trigger.txt in each workspace folder"
+        );
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            for folder in &paths {
+                let trigger = folder.join(".alzed-trigger.txt");
+                let content = match tokio::fs::read_to_string(&trigger).await {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                // Best-effort cleanup so a command fires exactly once.
+                let _ = tokio::fs::remove_file(&trigger).await;
+                let cmd = content.trim().to_string();
+                info!(folder = %folder.display(), command = %cmd, "trigger file detected");
+                if let Err(e) = handle_trigger(&cmd, folder, &session, &to_server).await {
+                    warn!(command = %cmd, error = %e, "trigger command failed");
+                }
+            }
+        }
+    });
+}
+
+async fn handle_trigger(
+    cmd: &str,
+    folder: &std::path::Path,
+    session: &Arc<Mutex<Session>>,
+    to_server: &mpsc::Sender<Vec<u8>>,
+) -> Result<()> {
+    match cmd {
+        "download-symbols" => trigger_download_symbols(folder, session, to_server).await,
+        "check-symbols" => trigger_check_symbols(session, to_server).await,
+        other => {
+            warn!(
+                command = other,
+                "unknown trigger command — supported: download-symbols, check-symbols"
+            );
+            Ok(())
+        }
+    }
+}
+
+async fn trigger_download_symbols(
+    folder: &std::path::Path,
+    session: &Arc<Mutex<Session>>,
+    to_server: &mpsc::Sender<Vec<u8>>,
+) -> Result<()> {
+    let launch_path = folder.join(".vscode").join("launch.json");
+    let launch_text = tokio::fs::read_to_string(&launch_path)
+        .await
+        .with_context(|| format!("reading {}", launch_path.display()))?;
+    let launch: Value = parse_jsonc(&launch_text)
+        .with_context(|| format!("parsing {}", launch_path.display()))?;
+    let config = launch
+        .get("configurations")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .cloned()
+        .ok_or_else(|| anyhow!("launch.json has no configurations[]"))?;
+
+    let id = session.lock().await.alloc_id("al/downloadSymbols");
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "al/downloadSymbols",
+        "params": config,
+    });
+    info!(
+        config_name = config.get("name").and_then(|n| n.as_str()).unwrap_or("?"),
+        id,
+        "sending al/downloadSymbols"
+    );
+    to_server.send(frame(&serde_json::to_vec(&request)?)).await?;
+    Ok(())
+}
+
+async fn trigger_check_symbols(
+    session: &Arc<Mutex<Session>>,
+    to_server: &mpsc::Sender<Vec<u8>>,
+) -> Result<()> {
+    let id = session.lock().await.alloc_id("al/checkSymbols");
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "al/checkSymbols",
+        "params": {}
+    });
+    info!(id, "sending al/checkSymbols");
+    to_server.send(frame(&serde_json::to_vec(&request)?)).await?;
+    Ok(())
+}
+
+/// Parse JSON-with-comments (the format VS Code uses for launch.json,
+/// settings.json, tasks.json). Strips // line comments and /* block */
+/// comments while respecting string literals, then runs serde_json on the
+/// result. Also tolerates trailing commas.
+fn parse_jsonc(input: &str) -> Result<Value> {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut in_string = false;
+    let mut escape = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                for nc in chars.by_ref() {
+                    if nc == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut prev = ' ';
+                for nc in chars.by_ref() {
+                    if prev == '*' && nc == '/' {
+                        break;
+                    }
+                    prev = nc;
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    // Strip trailing commas before } or ].
+    let mut cleaned = String::with_capacity(out.len());
+    let mut chars = out.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == ',' {
+            let mut lookahead = chars.clone();
+            let mut next_non_ws = None;
+            while let Some(&p) = lookahead.peek() {
+                if p.is_whitespace() {
+                    lookahead.next();
+                } else {
+                    next_non_ws = Some(p);
+                    break;
+                }
+            }
+            if matches!(next_non_ws, Some('}') | Some(']')) {
+                continue;
+            }
+        }
+        cleaned.push(c);
+    }
+    Ok(serde_json::from_str(&cleaned)?)
 }
 
 async fn run_handshake(
