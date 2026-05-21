@@ -1,22 +1,29 @@
-// Paste these entries into ~/.config/zed/tasks.json (or %APPDATA%\Zed\tasks.json
-// on Windows) to get "AL: Download symbols" and "AL: Check symbols" in Zed's
-// command palette under `task: spawn` — globally available in every project.
+// Paste these entries into ~/.config/zed/tasks.json (or
+// %APPDATA%\Zed\tasks.json on Windows) for "AL: Download symbols" and
+// "AL: Check symbols" in Zed's command palette under `task: spawn`.
 //
 // How it works:
-//   1. You pick the task from the palette.
-//   2. Zed runs the task in your project root (cwd).
-//   3. The task writes a one-line command into .alzed-trigger.txt.
-//   4. The bridge (alzed-bridge.exe) is watching that file. It picks up the
-//      command, fires the corresponding al/* request to the AL Language
-//      Server, and deletes the trigger file.
+//   1. You pick the task from the palette (Ctrl+Shift+P → task: spawn).
+//   2. Zed runs the task's shell command in the project root.
+//   3. The command writes one line into .alzed-trigger.txt.
+//   4. The bridge (alzed-bridge.exe) is watching that file — it picks up
+//      the command, fires the corresponding al/* request to the AL
+//      Language Server, and deletes the trigger file.
 //
-// The bridge must be running for these to do anything — which it is whenever
-// you have an AL workspace open in Zed.
+// The bridge must be running for these to do anything, which it is
+// whenever Zed has an AL workspace open.
+//
+// To sanity-check the bridge half *without* the task, open a terminal in
+// your project root and run:
+//
+//     echo download-symbols > .alzed-trigger.txt
+//
+// You should see `trigger file detected` then `sending al/downloadSymbols`
+// in the AL LSP log.
 [
   {
     "label": "AL: Download symbols",
-    "command": "powershell",
-    "args": ["-NoProfile", "-Command", "Set-Content -Path .alzed-trigger.txt -Value 'download-symbols'"],
+    "command": "echo download-symbols > .alzed-trigger.txt",
     "use_new_terminal": false,
     "allow_concurrent_runs": false,
     "reveal": "never",
@@ -24,8 +31,7 @@
   },
   {
     "label": "AL: Check symbols",
-    "command": "powershell",
-    "args": ["-NoProfile", "-Command", "Set-Content -Path .alzed-trigger.txt -Value 'check-symbols'"],
+    "command": "echo check-symbols > .alzed-trigger.txt",
     "use_new_terminal": false,
     "allow_concurrent_runs": false,
     "reveal": "never",
