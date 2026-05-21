@@ -686,11 +686,13 @@ const CMD_DOWNLOAD_SYMBOLS: &str = "alzed.al.downloadSymbols";
 const CMD_CHECK_SYMBOLS: &str = "alzed.al.checkSymbols";
 const CMD_BUILD: &str = "alzed.al.build";
 const CMD_PUBLISH: &str = "alzed.al.publish";
-const OUR_COMMANDS: [&str; 4] = [
+const CMD_RUN: &str = "alzed.al.run";
+const OUR_COMMANDS: [&str; 5] = [
     CMD_DOWNLOAD_SYMBOLS,
     CMD_CHECK_SYMBOLS,
     CMD_BUILD,
     CMD_PUBLISH,
+    CMD_RUN,
 ];
 
 /// Version string we report to the AL server in createPackage /
@@ -729,6 +731,7 @@ fn command_label_for_cmd(cmd: &str) -> &'static str {
         CMD_CHECK_SYMBOLS => "Check symbols",
         CMD_BUILD => "Build package",
         CMD_PUBLISH => "Publish",
+        CMD_RUN => "Run object",
         _ => "command",
     }
 }
@@ -1015,6 +1018,15 @@ fn inject_code_actions(v: &Value, original: &[u8], uri: Option<&str>) -> Result<
                 "arguments": [{ "uri": uri }],
             }
         }),
+        json!({
+            "title": "AL: Run object",
+            "kind": "refactor",
+            "command": {
+                "title": "AL: Run object",
+                "command": CMD_RUN,
+                "arguments": [{ "uri": uri }],
+            }
+        }),
     ];
     injected.append(arr_mut);
     *arr_mut = injected;
@@ -1087,6 +1099,10 @@ async fn handle_our_command(
         CMD_PUBLISH => match folder.as_deref() {
             Some(f) => trigger_publish(f, session, _to_server).await.map(Some),
             None => Err(anyhow!("no workspace folder resolved for publish")),
+        },
+        CMD_RUN => match folder.as_deref() {
+            Some(f) => trigger_run(f, session, to_client).await.map(|()| None),
+            None => Err(anyhow!("no workspace folder resolved for run")),
         },
         _ => Ok(None),
     };
@@ -1290,6 +1306,173 @@ async fn trigger_publish(
     );
     to_server.send(frame(&serde_json::to_vec(&request)?)).await?;
     Ok(id)
+}
+
+/// Build the Business Central web client URL for a given launch.json
+/// configuration. Returns `Err` if the configuration is missing fields we
+/// need (no server, or no startupObjectType/Id).
+fn build_run_url(cfg: &Value) -> Result<String> {
+    let object_type = cfg
+        .get("startupObjectType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Page");
+    let object_id = cfg
+        .get("startupObjectId")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow!("launch.json config has no startupObjectId — set one to use Run"))?;
+    let env_type = cfg
+        .get("environmentType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("OnPrem");
+    let company = cfg.get("startupCompany").and_then(|v| v.as_str());
+    let tenant = cfg.get("tenant").and_then(|v| v.as_str()).unwrap_or("");
+
+    // The URL query key BC uses for the object kind. Tables are run via
+    // `?table=`, codeunits aren't really runnable from the web client.
+    let kind_key = match object_type {
+        "Page" => "page",
+        "Report" => "report",
+        "Table" => "table",
+        "Query" => "query",
+        "Codeunit" => {
+            return Err(anyhow!(
+                "Codeunits can't be opened in the BC web client — use Run only for pages/reports/tables/queries"
+            ));
+        }
+        other => {
+            return Err(anyhow!(
+                "unsupported startupObjectType '{other}' — use Page, Report, Table, or Query"
+            ));
+        }
+    };
+
+    let base = match env_type {
+        "Sandbox" | "Production" => {
+            let env_name = cfg
+                .get("environmentName")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("cloud launch.json config has no environmentName"))?;
+            if tenant.is_empty() {
+                format!("https://businesscentral.dynamics.com/{env_name}/")
+            } else {
+                format!("https://businesscentral.dynamics.com/{tenant}/{env_name}/")
+            }
+        }
+        _ => {
+            // OnPrem: <server>[:<port>]/<serverInstance>/[?tenant=...]
+            let server = cfg
+                .get("server")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("on-prem launch.json config has no server"))?;
+            let server_instance = cfg
+                .get("serverInstance")
+                .and_then(|v| v.as_str())
+                .unwrap_or("BC");
+            // If server lacks a scheme, default to http://
+            let server = if server.starts_with("http://") || server.starts_with("https://") {
+                server.to_string()
+            } else {
+                format!("http://{server}")
+            };
+            let port = cfg.get("port").and_then(|v| v.as_u64());
+            let mut base = match port {
+                Some(p) => format!("{server}:{p}/{server_instance}/"),
+                None => format!("{server}/{server_instance}/"),
+            };
+            if !tenant.is_empty() {
+                base.push_str(&format!("?tenant={tenant}&"));
+            } else {
+                base.push('?');
+            }
+            // Trim trailing `?` if no tenant — query starts below.
+            if base.ends_with('?') {
+                base.push_str("");
+            }
+            base
+        }
+    };
+
+    // Assemble the final query. base ends with either `/` (cloud) or `?…&`
+    // / `?` (on-prem). Normalize so the next param starts with `?` or `&`.
+    let separator = if base.contains('?') {
+        if base.ends_with('?') || base.ends_with('&') {
+            ""
+        } else {
+            "&"
+        }
+    } else {
+        "?"
+    };
+
+    let mut url = format!("{base}{separator}{kind_key}={object_id}");
+    if let Some(c) = company {
+        // Spaces and other chars need percent-encoding for company names.
+        let encoded = percent_encode(c);
+        url.push_str(&format!("&company={encoded}"));
+    }
+    Ok(url)
+}
+
+/// Minimal percent-encoder for query-string values. Encodes everything
+/// outside the unreserved set per RFC 3986; good enough for company
+/// names like "CRONUS USA, Inc." without dragging in a new dep.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        let unreserved = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~');
+        if unreserved {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Run object — build the BC web client URL from launch.json and ask Zed
+/// to open it. We send `window/showDocument` with `external: true` so the
+/// client opens it in the default browser, and *also* fire a
+/// `window/showMessage` containing the URL as a fallback (if showDocument
+/// isn't supported, the user can still click/copy it from the toast).
+async fn trigger_run(
+    folder: &std::path::Path,
+    session: &Arc<Mutex<Session>>,
+    to_client: &mpsc::Sender<Vec<u8>>,
+) -> Result<()> {
+    let launch_path = folder.join(".vscode").join("launch.json");
+    let launch_text = tokio::fs::read_to_string(&launch_path)
+        .await
+        .with_context(|| format!("reading {}", launch_path.display()))?;
+    let launch: Value = parse_jsonc(&launch_text)
+        .with_context(|| format!("parsing {}", launch_path.display()))?;
+    let config = launch
+        .get("configurations")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .cloned()
+        .ok_or_else(|| anyhow!("launch.json has no configurations[]"))?;
+
+    let url = build_run_url(&config)?;
+    info!(url = %url, "computed BC web client URL for Run");
+
+    // window/showDocument request — server→client, with external: true.
+    // We don't care about the response; client_to_server consumes it.
+    let req_id = session.lock().await.alloc_client_id();
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "method": "window/showDocument",
+        "params": {
+            "uri": url,
+            "external": true,
+            "takeFocus": true,
+        }
+    });
+    to_client.send(frame(&serde_json::to_vec(&req)?)).await?;
+
+    // Fallback toast — also serves as a confirmation the URL is right.
+    emit_show_message(to_client, 3, &format!("AL: Run → {url}")).await;
+    Ok(())
 }
 
 /// Parse JSON-with-comments (the format VS Code uses for launch.json,
