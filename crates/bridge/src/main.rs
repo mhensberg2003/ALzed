@@ -109,9 +109,13 @@ struct WorkspaceFolder {
 #[derive(Default)]
 struct Session {
     workspace_folders: Vec<WorkspaceFolder>,
-    /// Request IDs that the client sent for `textDocument/hover`, so we can
-    /// normalize empty `{}` responses to `null` when they come back.
-    client_hover_ids: HashMap<String, ()>,
+    /// Client-issued request IDs → method names. Lets the server-to-client
+    /// pump recognize responses it wants to mutate (hover normalization,
+    /// initialize-capability injection, codeAction injection).
+    client_request_methods: HashMap<String, String>,
+    /// Per-request URI for codeAction calls, so the response handler can
+    /// decide whether to inject AL actions (only for app.json and *.al).
+    client_request_uris: HashMap<String, String>,
     /// Request IDs we (the bridge) generated, mapped to their method name so
     /// we can log responses meaningfully.
     bridge_inflight: HashMap<String, String>,
@@ -245,6 +249,22 @@ async fn client_to_server<R: AsyncRead + Unpin>(
             inspect_client_frame(v, &session).await;
         } else {
             trace!(target: "alzed_bridge::wire", bytes = body.len(), ">>> non-JSON");
+        }
+
+        // Intercept workspace/executeCommand for our custom commands.
+        if let Some(v) = &parsed {
+            if is_method_value(v, "workspace/executeCommand") {
+                if let Some(cmd) = v
+                    .get("params")
+                    .and_then(|p| p.get("command"))
+                    .and_then(|c| c.as_str())
+                {
+                    if OUR_COMMANDS.contains(&cmd) {
+                        handle_our_command(v, &session, &to_server).await;
+                        continue;
+                    }
+                }
+            }
         }
 
         let body_to_send = match parsed.as_ref() {
@@ -438,13 +458,24 @@ async fn server_to_client<R: AsyncRead + Unpin>(
 }
 
 async fn inspect_client_frame(v: &Value, session: &Arc<Mutex<Session>>) {
-    // Track hover request IDs.
+    // Track method by request id so we can mutate server responses later.
     if let (Some(method), Some(id)) = (
         v.get("method").and_then(|m| m.as_str()),
         json_id_to_string(v.get("id")),
     ) {
-        if method == "textDocument/hover" {
-            session.lock().await.client_hover_ids.insert(id, ());
+        let mut guard = session.lock().await;
+        guard
+            .client_request_methods
+            .insert(id.clone(), method.to_string());
+        if method == "textDocument/codeAction" {
+            if let Some(uri) = v
+                .get("params")
+                .and_then(|p| p.get("textDocument"))
+                .and_then(|t| t.get("uri"))
+                .and_then(|u| u.as_str())
+            {
+                guard.client_request_uris.insert(id, uri.to_string());
+            }
         }
     }
 
@@ -500,90 +531,199 @@ async fn maybe_normalize_hover(
         None => return Ok((true, original.to_vec())),
     };
 
-    let is_hover = {
+    let (method, uri) = {
         let mut guard = session.lock().await;
-        guard.client_hover_ids.remove(&id).is_some()
+        let method = guard.client_request_methods.remove(&id);
+        let uri = guard.client_request_uris.remove(&id);
+        (method, uri)
     };
 
-    if !is_hover {
-        return Ok((true, original.to_vec()));
+    let method = match method {
+        Some(m) => m,
+        None => return Ok((true, original.to_vec())),
+    };
+
+    match method.as_str() {
+        "textDocument/hover" => {
+            let needs_rewrite =
+                matches!(v.get("result"), Some(Value::Object(o)) if o.is_empty());
+            if !needs_rewrite {
+                return Ok((true, original.to_vec()));
+            }
+            let mut patched = v.clone();
+            if let Some(obj) = patched.as_object_mut() {
+                obj.insert("result".to_string(), Value::Null);
+            }
+            debug!(id, "normalized empty hover {{}} -> null");
+            Ok((true, serde_json::to_vec(&patched)?))
+        }
+        "initialize" => Ok((true, inject_execute_commands(v, original)?)),
+        "textDocument/codeAction" => {
+            Ok((true, inject_code_actions(v, original, uri.as_deref())?))
+        }
+        _ => Ok((true, original.to_vec())),
     }
+}
 
-    // Only rewrite when result is an empty object.
-    let needs_rewrite = matches!(v.get("result"), Some(Value::Object(o)) if o.is_empty());
+const CMD_DOWNLOAD_SYMBOLS: &str = "alzed.al.downloadSymbols";
+const CMD_CHECK_SYMBOLS: &str = "alzed.al.checkSymbols";
+const OUR_COMMANDS: [&str; 2] = [CMD_DOWNLOAD_SYMBOLS, CMD_CHECK_SYMBOLS];
 
-    if !needs_rewrite {
-        return Ok((true, original.to_vec()));
+/// Inject our custom commands into the server's `initialize` response so the
+/// client knows it can ask for them via `workspace/executeCommand`.
+fn inject_execute_commands(v: &Value, original: &[u8]) -> Result<Vec<u8>> {
+    let mut patched = v.clone();
+    let caps = patched
+        .pointer_mut("/result/capabilities")
+        .and_then(|c| c.as_object_mut());
+    let caps = match caps {
+        Some(c) => c,
+        None => return Ok(original.to_vec()),
+    };
+    let provider = caps
+        .entry("executeCommandProvider")
+        .or_insert_with(|| json!({"commands": []}));
+    let commands = provider
+        .as_object_mut()
+        .and_then(|o| o.entry("commands").or_insert_with(|| json!([])).as_array_mut());
+    if let Some(arr) = commands {
+        for cmd in OUR_COMMANDS {
+            if !arr.iter().any(|v| v.as_str() == Some(cmd)) {
+                arr.push(Value::String(cmd.to_string()));
+            }
+        }
+        info!("injected alzed commands into server capabilities");
+    }
+    Ok(serde_json::to_vec(&patched)?)
+}
+
+/// Prepend "AL: Download symbols" / "AL: Check symbols" actions to the
+/// codeAction response when the request was for app.json or a *.al file.
+fn inject_code_actions(v: &Value, original: &[u8], uri: Option<&str>) -> Result<Vec<u8>> {
+    let uri = match uri {
+        Some(u) => u,
+        None => return Ok(original.to_vec()),
+    };
+    let lower = uri.to_ascii_lowercase();
+    if !(lower.ends_with("/app.json") || lower.ends_with(".al")) {
+        return Ok(original.to_vec());
     }
 
     let mut patched = v.clone();
-    if let Some(obj) = patched.as_object_mut() {
-        obj.insert("result".to_string(), Value::Null);
-    }
-    debug!(id, "normalized empty hover {{}} -> null");
-    Ok((true, serde_json::to_vec(&patched)?))
+    let result = patched.pointer_mut("/result");
+    let arr_mut = match result {
+        Some(Value::Array(a)) => a,
+        Some(other @ Value::Null) => {
+            *other = Value::Array(Vec::new());
+            other.as_array_mut().unwrap()
+        }
+        _ => return Ok(original.to_vec()),
+    };
+
+    let mut injected = vec![
+        json!({
+            "title": "AL: Download symbols",
+            "kind": "source",
+            "command": {
+                "title": "AL: Download symbols",
+                "command": CMD_DOWNLOAD_SYMBOLS,
+                "arguments": [{ "uri": uri }],
+            }
+        }),
+        json!({
+            "title": "AL: Check symbols",
+            "kind": "source",
+            "command": {
+                "title": "AL: Check symbols",
+                "command": CMD_CHECK_SYMBOLS,
+                "arguments": [{ "uri": uri }],
+            }
+        }),
+    ];
+    injected.append(arr_mut);
+    *arr_mut = injected;
+
+    debug!(uri, "injected AL code actions into codeAction response");
+    Ok(serde_json::to_vec(&patched)?)
 }
 
 fn spawn_handshake(session: Arc<Mutex<Session>>, to_server: mpsc::Sender<Vec<u8>>) {
     tokio::spawn(async move {
-        if let Err(e) = run_handshake(session.clone(), to_server.clone()).await {
+        if let Err(e) = run_handshake(session, to_server).await {
             error!(error = %e, "AL handshake failed");
         }
-        // After handshake, start the trigger-file watcher so users can invoke
-        // commands like download-symbols from outside Zed.
-        spawn_trigger_watcher(session, to_server);
     });
 }
 
-fn spawn_trigger_watcher(session: Arc<Mutex<Session>>, to_server: mpsc::Sender<Vec<u8>>) {
-    tokio::spawn(async move {
-        let folders = session.lock().await.workspace_folders.clone();
-        let paths: Vec<PathBuf> = folders
+/// Handle our injected commands locally. The bridge never forwards them to
+/// the AL server as-is — instead each one maps to one or more al/* requests.
+/// We respond to the client immediately with null so it doesn't block the UI;
+/// the actual al/* result comes back asynchronously and is logged.
+async fn handle_our_command(
+    req: &Value,
+    session: &Arc<Mutex<Session>>,
+    _to_server: &mpsc::Sender<Vec<u8>>,
+) {
+    let cmd = req
+        .get("params")
+        .and_then(|p| p.get("command"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    let id = req.get("id").cloned();
+    let arg_uri = req
+        .get("params")
+        .and_then(|p| p.get("arguments"))
+        .and_then(|a| a.as_array())
+        .and_then(|a| a.first())
+        .and_then(|a| a.get("uri"))
+        .and_then(|u| u.as_str())
+        .map(|s| s.to_string());
+
+    info!(command = cmd, uri = ?arg_uri, "executing alzed command");
+
+    // Resolve the project folder: prefer the workspace containing the
+    // invocation URI, fall back to the first workspace folder.
+    let folder = {
+        let guard = session.lock().await;
+        let folders: Vec<PathBuf> = guard
+            .workspace_folders
             .iter()
             .filter_map(|f| uri_to_path(&f.uri))
             .collect();
-        if paths.is_empty() {
-            return;
-        }
-        info!(
-            count = paths.len(),
-            "watching for .alzed-trigger.txt in each workspace folder"
-        );
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            for folder in &paths {
-                let trigger = folder.join(".alzed-trigger.txt");
-                let content = match tokio::fs::read_to_string(&trigger).await {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                // Best-effort cleanup so a command fires exactly once.
-                let _ = tokio::fs::remove_file(&trigger).await;
-                let cmd = content.trim().to_string();
-                info!(folder = %folder.display(), command = %cmd, "trigger file detected");
-                if let Err(e) = handle_trigger(&cmd, folder, &session, &to_server).await {
-                    warn!(command = %cmd, error = %e, "trigger command failed");
-                }
-            }
-        }
-    });
-}
+        let from_uri = arg_uri
+            .as_deref()
+            .and_then(uri_to_path)
+            .and_then(|p| folders.iter().find(|f| p.starts_with(f)).cloned());
+        from_uri.or_else(|| folders.first().cloned())
+    };
 
-async fn handle_trigger(
-    cmd: &str,
-    folder: &std::path::Path,
-    session: &Arc<Mutex<Session>>,
-    to_server: &mpsc::Sender<Vec<u8>>,
-) -> Result<()> {
-    match cmd {
-        "download-symbols" => trigger_download_symbols(folder, session, to_server).await,
-        "check-symbols" => trigger_check_symbols(session, to_server).await,
-        other => {
-            warn!(
-                command = other,
-                "unknown trigger command — supported: download-symbols, check-symbols"
-            );
-            Ok(())
+    let result = match cmd {
+        CMD_DOWNLOAD_SYMBOLS => match folder.as_deref() {
+            Some(f) => trigger_download_symbols(f, session, _to_server).await,
+            None => Err(anyhow!("no workspace folder resolved for downloadSymbols")),
+        },
+        CMD_CHECK_SYMBOLS => trigger_check_symbols(session, _to_server).await,
+        _ => Ok(()),
+    };
+    if let Err(e) = result {
+        warn!(command = cmd, error = %e, "alzed command failed");
+    }
+
+    // Acknowledge the executeCommand back to the client with null. We write
+    // directly to stdout; this is the only place outside writer_pump_stdout
+    // that touches stdout — the synchronization risk is tiny (single byte
+    // sequences) and the alternative (threading another channel) isn't worth
+    // the complexity for a single response.
+    if let Some(id_val) = id {
+        let ack = json!({ "jsonrpc": "2.0", "id": id_val, "result": null });
+        if let Ok(bytes) = serde_json::to_vec(&ack) {
+            let mut out = tokio::io::stdout();
+            let framed = frame(&bytes);
+            if let Err(e) = out.write_all(&framed).await {
+                warn!(error = %e, "failed to ack executeCommand to client");
+            } else {
+                let _ = out.flush().await;
+            }
         }
     }
 }
