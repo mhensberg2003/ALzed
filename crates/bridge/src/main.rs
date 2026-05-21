@@ -239,20 +239,84 @@ async fn client_to_server<R: AsyncRead + Unpin>(
             }
         };
 
-        if let Ok(v) = serde_json::from_slice::<Value>(&body) {
-            trace_frame(">>>", &v);
-            inspect_client_frame(&v, &session).await;
+        let parsed: Option<Value> = serde_json::from_slice(&body).ok();
+        if let Some(v) = &parsed {
+            trace_frame(">>>", v);
+            inspect_client_frame(v, &session).await;
         } else {
             trace!(target: "alzed_bridge::wire", bytes = body.len(), ">>> non-JSON");
         }
 
-        to_server.send(frame(&body)).await?;
+        let body_to_send = match parsed.as_ref() {
+            Some(v) if is_method_value(v, "workspace/didChangeConfiguration") => {
+                rewrite_did_change_configuration(v, &session).await
+            }
+            _ => body.clone(),
+        };
+
+        to_server.send(frame(&body_to_send)).await?;
 
         // Fire the AL handshake right after `initialized` flows through.
         if is_method(&body, "initialized") {
             spawn_handshake(session.clone(), to_server.clone());
         }
     }
+}
+
+fn is_method_value(v: &Value, method: &str) -> bool {
+    v.get("method").and_then(|m| m.as_str()) == Some(method)
+}
+
+/// Zed wraps LSP settings under the language-server id (`{settings:{al:{...}}}`),
+/// but the MS AL server expects settings flat under `settings`. Unwrap the
+/// `al` namespace and merge in our defaults so the very first config the
+/// server sees is well-formed.
+async fn rewrite_did_change_configuration(v: &Value, session: &Arc<Mutex<Session>>) -> Vec<u8> {
+    let user_al = v
+        .get("params")
+        .and_then(|p| p.get("settings"))
+        .and_then(|s| s.get("al"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    let folders = session.lock().await.workspace_folders.clone();
+    let default_package_cache_path = folders
+        .first()
+        .and_then(|f| uri_to_path(&f.uri))
+        .map(|p| p.join(".alpackages").to_string_lossy().into_owned())
+        .unwrap_or_else(|| "./.alpackages".to_string());
+
+    let mut merged = default_al_settings(&default_package_cache_path);
+    if let Value::Object(user_map) = user_al {
+        if let Value::Object(merged_map) = &mut merged {
+            for (k, v) in user_map {
+                merged_map.insert(k, v);
+            }
+        }
+    }
+
+    let rewritten = json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeConfiguration",
+        "params": { "settings": merged }
+    });
+
+    debug!(target: "alzed_bridge", "rewrote workspace/didChangeConfiguration: unwrapped al namespace and merged defaults");
+    serde_json::to_vec(&rewritten).expect("rewrite serialization must succeed")
+}
+
+fn default_al_settings(package_cache_path: &str) -> Value {
+    json!({
+        "packageCachePath": package_cache_path,
+        "enableCodeAnalysis": false,
+        "backgroundCodeAnalysis": "Project",
+        "codeAnalyzers": [],
+        "ruleSetPath": "",
+        "incrementalBuild": false,
+        "assemblyProbingPaths": ["./.netpackages"],
+        "dependencyClosure": [],
+        "projectReferences": []
+    })
 }
 
 async fn server_to_client<R: AsyncRead + Unpin>(
@@ -473,51 +537,27 @@ async fn run_handshake(
         let body = serde_json::to_vec(&request)?;
         to_server.send(frame(&body)).await?;
 
-        // After loadManifest, push a workspace/didChangeConfiguration so the
-        // AL server actually starts analyzing. The VS Code extension does this
-        // via sendConfigurationChange after a manifest is loaded. Without it
-        // the server has the manifest but no config, and stays idle.
-        send_did_change_configuration(&project_path, &to_server).await?;
+        // After loadManifest, push a workspace/didChangeConfiguration with
+        // flat AL settings so the server starts analyzing. (Zed's automatic
+        // didChangeConfiguration is also rewritten by the client pump, but we
+        // re-send here in case ours arrives first.)
+        let package_cache_path = project_path
+            .join(".alpackages")
+            .to_string_lossy()
+            .into_owned();
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeConfiguration",
+            "params": { "settings": default_al_settings(&package_cache_path) }
+        });
+        info!(
+            project = %project_path.display(),
+            "sending workspace/didChangeConfiguration (flat settings)"
+        );
+        let body = serde_json::to_vec(&notification)?;
+        to_server.send(frame(&body)).await?;
     }
 
-    Ok(())
-}
-
-async fn send_did_change_configuration(
-    project_path: &std::path::Path,
-    to_server: &mpsc::Sender<Vec<u8>>,
-) -> Result<()> {
-    let package_cache_path = project_path
-        .join(".alpackages")
-        .to_string_lossy()
-        .into_owned();
-
-    let notification = json!({
-        "jsonrpc": "2.0",
-        "method": "workspace/didChangeConfiguration",
-        "params": {
-            "settings": {
-                "al": {
-                    "packageCachePath": package_cache_path,
-                    "enableCodeAnalysis": false,
-                    "backgroundCodeAnalysis": "Project",
-                    "codeAnalyzers": [],
-                    "ruleSetPath": "",
-                    "incrementalBuild": false,
-                    "assemblyProbingPaths": ["./.netpackages"],
-                    "dependencyClosure": [],
-                    "projectReferences": []
-                }
-            }
-        }
-    });
-
-    info!(
-        project = %project_path.display(),
-        "sending workspace/didChangeConfiguration"
-    );
-    let body = serde_json::to_vec(&notification)?;
-    to_server.send(frame(&body)).await?;
     Ok(())
 }
 
