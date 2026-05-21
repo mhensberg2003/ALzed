@@ -1,0 +1,6 @@
+/target
+/grammars
+Cargo.lock
+*.wasm
+.DS_Store
+.zed-extension-build/
