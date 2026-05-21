@@ -752,6 +752,7 @@ fn inject_code_actions(v: &Value, original: &[u8], uri: Option<&str>) -> Result<
     let mut injected = vec![
         json!({
             "title": "AL: Download symbols",
+            "kind": "refactor",
             "isPreferred": true,
             "command": {
                 "title": "AL: Download symbols",
@@ -761,6 +762,7 @@ fn inject_code_actions(v: &Value, original: &[u8], uri: Option<&str>) -> Result<
         }),
         json!({
             "title": "AL: Check symbols",
+            "kind": "refactor",
             "isPreferred": true,
             "command": {
                 "title": "AL: Check symbols",
