@@ -494,7 +494,7 @@ async fn run_handshake(
         return Ok(());
     }
 
-    for (index, folder) in folders.into_iter().enumerate() {
+    for folder in folders {
         let project_path = match uri_to_path(&folder.uri) {
             Some(p) => p,
             None => {
@@ -563,18 +563,16 @@ async fn run_handshake(
         //    actually start analyzing. The VS Code extension calls this for
         //    the active workspace folder right after loading the manifest;
         //    without it, the server stays idle and every editor request
-        //    returns empty.
+        //    returns empty. The server expects currentWorkspaceFolderPath
+        //    as a STRING path despite the field's object-y name (it builds
+        //    a DirectoryInfo from it).
         let active_id = session.lock().await.alloc_id("al/setActiveWorkspace");
         let active_request = json!({
             "jsonrpc": "2.0",
             "id": active_id,
             "method": "al/setActiveWorkspace",
             "params": {
-                "currentWorkspaceFolderPath": {
-                    "uri": folder.uri,
-                    "name": folder.name,
-                    "index": index,
-                },
+                "currentWorkspaceFolderPath": project_path.to_string_lossy(),
                 "settings": settings,
             }
         });
