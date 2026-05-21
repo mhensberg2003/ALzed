@@ -273,3 +273,23 @@ MIT (see [LICENSE](LICENSE)). The tree-sitter grammar is MIT-licensed by
 its author. The bundled snippets are hand-authored for this project.
 The Microsoft AL Language Server is proprietary and is **not**
 redistributed — users obtain it via the official VS Code AL extension.
+
+## Trademarks and disclaimer
+
+ALzed is an independent, community-built project. It is **not affiliated
+with, endorsed by, or sponsored by Microsoft Corporation, Zed Industries,
+or any of their subsidiaries**.
+
+"Microsoft", "Dynamics 365", "Business Central", "Visual Studio Code",
+and "AL" (in the context of the AL language) are trademarks of Microsoft
+Corporation. "Zed" is a trademark of Zed Industries. All other trademarks
+are the property of their respective owners. Trademarks are used here in
+their nominative sense, solely to describe interoperability and
+compatibility — the use of these names does not imply any partnership or
+authorization.
+
+ALzed interacts with Microsoft's AL Language Server only through the
+public LSP-style stdio protocol it exposes. No proprietary Microsoft
+binaries or source files are bundled, modified, or redistributed by this
+project. To use ALzed, you must independently install the official
+Microsoft VS Code AL extension under the license terms set by Microsoft.

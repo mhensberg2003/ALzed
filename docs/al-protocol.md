@@ -13,19 +13,30 @@ The catch: the server is **inert** until the client registers each workspace's
 `app.json` via `al/loadManifest`. Until then, standard LSP requests return
 empty responses — looking from the outside like a broken server.
 
-This document captures what we learn by inspecting the bundled JS client in
-`ms-dynamics-smb.al/dist/extension.js`. It is the spec the bridge implements.
+This document captures the AL custom protocol as observed from the
+behavior of the official VS Code AL extension client. It is the spec the
+bridge implements.
 
 ## Source of truth
 
-- VS Code AL extension: `ms-dynamics-smb.al` (proprietary; the JS client is
-  shipped readable inside the installed extension folder).
-- Inspected version: **17.0.2273547**.
+The Microsoft AL Language Server itself is closed-source, but the official
+VS Code AL extension (`ms-dynamics-smb.al`) ships a JavaScript client that
+talks to it. Observing that client's behavior against a running server tells
+us exactly what handshake and methods the server expects.
+
+Everything in this document is derived from external observation of method
+names, request/response shapes, and protocol ordering — i.e. facts about
+the wire protocol needed to interoperate with the server, not the
+expression of Microsoft's code. The same conclusions could be reached by
+black-box tracing of the stdio LSP channel.
+
+- Inspected client version: **17.0.2273547** (April 2026 build).
+- Observation method: enumerate symbol names, then trace which params and
+  response shapes appear at each call site.
 
 ## The activation handshake
 
-This is what the VS Code TypeScript shim does that Zed cannot. Without it the
-server stays idle.
+This is the bit Zed cannot natively do. Without it the server stays idle.
 
 ```text
 1. LSP initialize / initialized            (standard)
@@ -37,23 +48,13 @@ server stays idle.
 4. Server begins analysis. Standard LSP requests now return real results.
 ```
 
-Evidence from the bundle (de-minified excerpt):
-
-```js
-// Path: function reading app.json then registering with the server
-const text = (await workspace.openTextDocument(projectFileUri))?.getText();
-const params = { projectFolder: path.dirname(projectFileUri.fsPath), manifest: text };
-const result = await client.sendRequest(AlLoadManifestRequest, params);
-if (result.success) {
-  return Manifest.parse(result.manifest);
-}
-
-// Readiness notification handler
-client.onRequest(AlActiveProjectLoaded, async (e) => {
-  const folder = workspace.getWorkspaceFolder(Uri.parse(e.activeProjectFolder));
-  if (folder) await this.loadProjectReferences(folder, new Set());
-});
-```
+In prose: the client opens each workspace folder's `app.json`, sends its
+text plus the folder path as an `al/loadManifest` request, and expects
+`{ success, manifest }` back. The server later pushes an
+`al/activeProjectLoaded` notification with the folder URI once that
+project's symbol closure has loaded; only then will standard LSP requests
+on that project return real results. Workspace folder removal isn't
+mirrored back to `al/loadManifest` — see "Open questions" below.
 
 ### `al/loadManifest`
 
@@ -90,7 +91,7 @@ Mirror folder changes here with the same `{ added, removed }` shape.
 ### `al/didChangeActiveDocument` (client → server, notification)
 
 Tells the server which document is focused so it can prioritize analysis. The
-bundle calls this on VS Code's `onDidChangeActiveTextEditor`.
+VS Code client emits this when the active text editor changes.
 
 ```ts
 { uri: string }
@@ -228,7 +229,7 @@ In rough order of value-to-effort:
   `al/loadManifest` again after VS Code/Zed reopens?
 - How does workspace folder removal interact with `al/loadManifest`? Is there
   a corresponding `al/unloadManifest` or does `al/didChangeWorkspaceFolders`
-  cover it? (Need to find the unload path in the bundle.)
+  cover it? (Need to observe the unload path in the VS Code client.)
 
 Each becomes a quick experiment once the bridge is running against a real
 session.
