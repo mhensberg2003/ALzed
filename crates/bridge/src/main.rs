@@ -467,7 +467,7 @@ async fn inspect_client_frame(v: &Value, session: &Arc<Mutex<Session>>) {
         guard
             .client_request_methods
             .insert(id.clone(), method.to_string());
-        if method == "textDocument/codeAction" {
+        if matches!(method, "textDocument/codeAction" | "textDocument/codeLens") {
             if let Some(uri) = v
                 .get("params")
                 .and_then(|p| p.get("textDocument"))
@@ -561,6 +561,9 @@ async fn maybe_normalize_hover(
         "textDocument/codeAction" => {
             Ok((true, inject_code_actions(v, original, uri.as_deref())?))
         }
+        "textDocument/codeLens" => {
+            Ok((true, inject_code_lenses(v, original, uri.as_deref())?))
+        }
         _ => Ok((true, original.to_vec())),
     }
 }
@@ -569,8 +572,9 @@ const CMD_DOWNLOAD_SYMBOLS: &str = "alzed.al.downloadSymbols";
 const CMD_CHECK_SYMBOLS: &str = "alzed.al.checkSymbols";
 const OUR_COMMANDS: [&str; 2] = [CMD_DOWNLOAD_SYMBOLS, CMD_CHECK_SYMBOLS];
 
-/// Inject our custom commands into the server's `initialize` response so the
-/// client knows it can ask for them via `workspace/executeCommand`.
+/// Inject our custom commands and codeLensProvider into the server's
+/// `initialize` response so the client knows it can ask for them via
+/// `workspace/executeCommand` and `textDocument/codeLens`.
 fn inject_execute_commands(v: &Value, original: &[u8]) -> Result<Vec<u8>> {
     let mut patched = v.clone();
     let caps = patched
@@ -580,20 +584,85 @@ fn inject_execute_commands(v: &Value, original: &[u8]) -> Result<Vec<u8>> {
         Some(c) => c,
         None => return Ok(original.to_vec()),
     };
+
+    // executeCommandProvider.commands += our two commands
     let provider = caps
         .entry("executeCommandProvider")
         .or_insert_with(|| json!({"commands": []}));
-    let commands = provider
+    if let Some(arr) = provider
         .as_object_mut()
-        .and_then(|o| o.entry("commands").or_insert_with(|| json!([])).as_array_mut());
-    if let Some(arr) = commands {
+        .and_then(|o| o.entry("commands").or_insert_with(|| json!([])).as_array_mut())
+    {
         for cmd in OUR_COMMANDS {
             if !arr.iter().any(|v| v.as_str() == Some(cmd)) {
                 arr.push(Value::String(cmd.to_string()));
             }
         }
-        info!("injected alzed commands into server capabilities");
     }
+
+    // codeLensProvider — claim support so Zed asks us for lenses on every
+    // open file. We inject AL: Download/Check on .al and app.json files.
+    if !caps.contains_key("codeLensProvider") {
+        caps.insert(
+            "codeLensProvider".to_string(),
+            json!({ "resolveProvider": false }),
+        );
+    }
+
+    info!("injected alzed commands + codeLensProvider into server capabilities");
+    Ok(serde_json::to_vec(&patched)?)
+}
+
+/// Prepend "AL: Download symbols" / "AL: Check symbols" code lenses to the
+/// server's codeLens response for .al files and app.json.
+fn inject_code_lenses(v: &Value, original: &[u8], uri: Option<&str>) -> Result<Vec<u8>> {
+    let uri = match uri {
+        Some(u) => u,
+        None => return Ok(original.to_vec()),
+    };
+    let lower = uri.to_ascii_lowercase();
+    if !(lower.ends_with("/app.json") || lower.ends_with(".al")) {
+        return Ok(original.to_vec());
+    }
+
+    let mut patched = v.clone();
+    let result = patched.pointer_mut("/result");
+    let arr_mut = match result {
+        Some(Value::Array(a)) => a,
+        Some(other) => {
+            *other = Value::Array(Vec::new());
+            other.as_array_mut().unwrap()
+        }
+        None => return Ok(original.to_vec()),
+    };
+
+    let anchor = json!({
+        "start": {"line": 0, "character": 0},
+        "end":   {"line": 0, "character": 0},
+    });
+
+    let mut injected = vec![
+        json!({
+            "range": anchor,
+            "command": {
+                "title": "AL: Download symbols",
+                "command": CMD_DOWNLOAD_SYMBOLS,
+                "arguments": [{ "uri": uri }],
+            }
+        }),
+        json!({
+            "range": anchor,
+            "command": {
+                "title": "AL: Check symbols",
+                "command": CMD_CHECK_SYMBOLS,
+                "arguments": [{ "uri": uri }],
+            }
+        }),
+    ];
+    injected.append(arr_mut);
+    *arr_mut = injected;
+
+    debug!(uri, "injected AL code lenses into codeLens response");
     Ok(serde_json::to_vec(&patched)?)
 }
 
@@ -649,120 +718,10 @@ fn inject_code_actions(v: &Value, original: &[u8], uri: Option<&str>) -> Result<
 
 fn spawn_handshake(session: Arc<Mutex<Session>>, to_server: mpsc::Sender<Vec<u8>>) {
     tokio::spawn(async move {
-        if let Err(e) = run_handshake(session.clone(), to_server.clone()).await {
+        if let Err(e) = run_handshake(session, to_server).await {
             error!(error = %e, "AL handshake failed");
         }
-        spawn_trigger_watcher(session, to_server);
     });
-}
-
-/// Watch each workspace folder for `.alzed-trigger.txt`. When the file
-/// appears, its trimmed contents are treated as a command name (e.g.
-/// `download-symbols`, `check-symbols`) and dispatched. The file is removed
-/// immediately so a command fires exactly once.
-///
-/// This exists primarily so Zed *tasks* (defined in ~/.config/zed/tasks.json)
-/// can invoke alzed commands via the command palette — tasks can only run
-/// shell commands, so they touch this file and the bridge does the rest.
-fn spawn_trigger_watcher(session: Arc<Mutex<Session>>, to_server: mpsc::Sender<Vec<u8>>) {
-    tokio::spawn(async move {
-        let folders = session.lock().await.workspace_folders.clone();
-        let paths: Vec<PathBuf> = folders
-            .iter()
-            .filter_map(|f| uri_to_path(&f.uri))
-            .collect();
-        if paths.is_empty() {
-            return;
-        }
-        info!(
-            count = paths.len(),
-            "watching .alzed-trigger.txt in each workspace folder"
-        );
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            for folder in &paths {
-                let trigger = folder.join(".alzed-trigger.txt");
-                let raw = match tokio::fs::read(&trigger).await {
-                    Ok(b) => b,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(e) => {
-                        warn!(
-                            path = %trigger.display(),
-                            error = %e,
-                            "trigger file present but unreadable"
-                        );
-                        let _ = tokio::fs::remove_file(&trigger).await;
-                        continue;
-                    }
-                };
-                let _ = tokio::fs::remove_file(&trigger).await;
-                let content = decode_trigger_bytes(&raw);
-                let cmd = content.trim().to_string();
-                info!(
-                    folder = %folder.display(),
-                    command = %cmd,
-                    bytes = raw.len(),
-                    "trigger file detected"
-                );
-                if let Err(e) = dispatch_trigger(&cmd, folder, &session, &to_server).await {
-                    warn!(command = %cmd, error = %e, "trigger command failed");
-                }
-            }
-        }
-    });
-}
-
-/// Decode trigger-file bytes, accepting UTF-8 (with or without BOM) and
-/// UTF-16 LE/BE (with BOM). PowerShell's default `>` redirect writes UTF-16
-/// LE with a BOM on Windows; cmd.exe writes ANSI/UTF-8. We want both to work
-/// without the user thinking about it.
-fn decode_trigger_bytes(raw: &[u8]) -> String {
-    // UTF-8 BOM
-    if raw.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        return String::from_utf8_lossy(&raw[3..]).into_owned();
-    }
-    // UTF-16 LE BOM
-    if raw.starts_with(&[0xFF, 0xFE]) {
-        return decode_utf16_pairs(&raw[2..], true);
-    }
-    // UTF-16 BE BOM
-    if raw.starts_with(&[0xFE, 0xFF]) {
-        return decode_utf16_pairs(&raw[2..], false);
-    }
-    String::from_utf8_lossy(raw).into_owned()
-}
-
-fn decode_utf16_pairs(bytes: &[u8], little_endian: bool) -> String {
-    let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| {
-            if little_endian {
-                u16::from_le_bytes([c[0], c[1]])
-            } else {
-                u16::from_be_bytes([c[0], c[1]])
-            }
-        })
-        .collect();
-    String::from_utf16_lossy(&units)
-}
-
-async fn dispatch_trigger(
-    cmd: &str,
-    folder: &std::path::Path,
-    session: &Arc<Mutex<Session>>,
-    to_server: &mpsc::Sender<Vec<u8>>,
-) -> Result<()> {
-    match cmd {
-        "download-symbols" => trigger_download_symbols(folder, session, to_server).await,
-        "check-symbols" => trigger_check_symbols(session, to_server).await,
-        other => {
-            warn!(
-                command = other,
-                "unknown trigger command — supported: download-symbols, check-symbols"
-            );
-            Ok(())
-        }
-    }
 }
 
 /// Handle our injected commands locally. The bridge never forwards them to
