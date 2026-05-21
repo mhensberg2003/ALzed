@@ -682,19 +682,68 @@ fn spawn_trigger_watcher(session: Arc<Mutex<Session>>, to_server: mpsc::Sender<V
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             for folder in &paths {
                 let trigger = folder.join(".alzed-trigger.txt");
-                let content = match tokio::fs::read_to_string(&trigger).await {
-                    Ok(s) => s,
-                    Err(_) => continue,
+                let raw = match tokio::fs::read(&trigger).await {
+                    Ok(b) => b,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        warn!(
+                            path = %trigger.display(),
+                            error = %e,
+                            "trigger file present but unreadable"
+                        );
+                        let _ = tokio::fs::remove_file(&trigger).await;
+                        continue;
+                    }
                 };
                 let _ = tokio::fs::remove_file(&trigger).await;
+                let content = decode_trigger_bytes(&raw);
                 let cmd = content.trim().to_string();
-                info!(folder = %folder.display(), command = %cmd, "trigger file detected");
+                info!(
+                    folder = %folder.display(),
+                    command = %cmd,
+                    bytes = raw.len(),
+                    "trigger file detected"
+                );
                 if let Err(e) = dispatch_trigger(&cmd, folder, &session, &to_server).await {
                     warn!(command = %cmd, error = %e, "trigger command failed");
                 }
             }
         }
     });
+}
+
+/// Decode trigger-file bytes, accepting UTF-8 (with or without BOM) and
+/// UTF-16 LE/BE (with BOM). PowerShell's default `>` redirect writes UTF-16
+/// LE with a BOM on Windows; cmd.exe writes ANSI/UTF-8. We want both to work
+/// without the user thinking about it.
+fn decode_trigger_bytes(raw: &[u8]) -> String {
+    // UTF-8 BOM
+    if raw.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8_lossy(&raw[3..]).into_owned();
+    }
+    // UTF-16 LE BOM
+    if raw.starts_with(&[0xFF, 0xFE]) {
+        return decode_utf16_pairs(&raw[2..], true);
+    }
+    // UTF-16 BE BOM
+    if raw.starts_with(&[0xFE, 0xFF]) {
+        return decode_utf16_pairs(&raw[2..], false);
+    }
+    String::from_utf8_lossy(raw).into_owned()
+}
+
+fn decode_utf16_pairs(bytes: &[u8], little_endian: bool) -> String {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| {
+            if little_endian {
+                u16::from_le_bytes([c[0], c[1]])
+            } else {
+                u16::from_be_bytes([c[0], c[1]])
+            }
+        })
+        .collect();
+    String::from_utf16_lossy(&units)
 }
 
 async fn dispatch_trigger(
