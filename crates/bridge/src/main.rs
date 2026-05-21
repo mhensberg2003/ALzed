@@ -430,18 +430,45 @@ async fn server_to_client<R: AsyncRead + Unpin>(
         }
 
         // Handle responses to bridge-initiated requests — consume locally, never
-        // forward to Zed (it didn't send the request).
+        // forward to Zed (it didn't send the request). If the request was a
+        // user-facing command (downloadSymbols / checkSymbols), also surface
+        // the outcome to the client via window/showMessage so it's visible in
+        // Zed as a notification toast, not just in the bridge log.
         if let Some(id_str) = json_id_to_string(v.get("id")) {
             let method = session.lock().await.bridge_inflight.remove(&id_str);
             if let Some(method) = method {
                 if let Some(err) = v.get("error") {
                     warn!(method = %method, error = %err, "bridge request failed");
+                    if is_user_facing_command(&method) {
+                        let msg = format!(
+                            "AL: {label} failed — {err}",
+                            label = command_label(&method),
+                            err = err
+                                .get("message")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("see language server log")
+                        );
+                        emit_show_message(&to_client, 1, &msg).await;
+                    }
                 } else {
                     debug!(
                         method = %method,
                         result = %truncate(&v.get("result").map(|r| r.to_string()).unwrap_or_default(), 200),
                         "bridge request ok"
                     );
+                    if is_user_facing_command(&method) {
+                        let success = v
+                            .get("result")
+                            .and_then(|r| r.get("success"))
+                            .and_then(|s| s.as_bool())
+                            .unwrap_or(true);
+                        let (severity, body) = if success {
+                            (3, format!("AL: {} ✓", command_label(&method)))
+                        } else {
+                            (2, format!("AL: {} reported failure", command_label(&method)))
+                        };
+                        emit_show_message(&to_client, severity, &body).await;
+                    }
                 }
                 continue;
             }
@@ -586,6 +613,37 @@ async fn maybe_normalize_hover(
 const CMD_DOWNLOAD_SYMBOLS: &str = "alzed.al.downloadSymbols";
 const CMD_CHECK_SYMBOLS: &str = "alzed.al.checkSymbols";
 const OUR_COMMANDS: [&str; 2] = [CMD_DOWNLOAD_SYMBOLS, CMD_CHECK_SYMBOLS];
+
+/// AL request methods whose responses should be surfaced to the user via
+/// `window/showMessage`. Background handshake methods (al/loadManifest,
+/// al/setActiveWorkspace) are excluded — they're noise from the user's POV.
+fn is_user_facing_command(method: &str) -> bool {
+    matches!(method, "al/downloadSymbols" | "al/checkSymbols")
+}
+
+fn command_label(method: &str) -> &'static str {
+    match method {
+        "al/downloadSymbols" => "Download symbols",
+        "al/checkSymbols" => "Check symbols",
+        _ => "command",
+    }
+}
+
+/// Emit a server→client `window/showMessage` notification, which Zed renders
+/// as a toast.
+///
+/// Severities: 1 = Error, 2 = Warning, 3 = Info, 4 = Log.
+async fn emit_show_message(to_client: &mpsc::Sender<Vec<u8>>, severity: u8, message: &str) {
+    let notif = json!({
+        "jsonrpc": "2.0",
+        "method": "window/showMessage",
+        "params": { "type": severity, "message": message }
+    });
+    if let Ok(bytes) = serde_json::to_vec(&notif) {
+        let _ = to_client.send(frame(&bytes)).await;
+    }
+    info!(severity, message, "emitted window/showMessage to client");
+}
 
 /// Inject our custom commands and codeLensProvider into the server's
 /// `initialize` response so the client knows it can ask for them via
