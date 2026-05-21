@@ -240,9 +240,10 @@ async fn client_to_server<R: AsyncRead + Unpin>(
         };
 
         if let Ok(v) = serde_json::from_slice::<Value>(&body) {
+            trace_frame(">>>", &v);
             inspect_client_frame(&v, &session).await;
         } else {
-            trace!(target: "alzed_bridge::wire", bytes = body.len(), "client->server non-JSON");
+            trace!(target: "alzed_bridge::wire", bytes = body.len(), ">>> non-JSON");
         }
 
         to_server.send(frame(&body)).await?;
@@ -272,11 +273,13 @@ async fn server_to_client<R: AsyncRead + Unpin>(
         let v: Value = match serde_json::from_slice(&body) {
             Ok(v) => v,
             Err(_) => {
-                trace!(target: "alzed_bridge::wire", bytes = body.len(), "server->client non-JSON");
+                trace!(target: "alzed_bridge::wire", bytes = body.len(), "<<< non-JSON");
                 to_client.send(frame(&body)).await?;
                 continue;
             }
         };
+
+        trace_frame("<<<", &v);
 
         // Handle responses to bridge-initiated requests — consume locally, never
         // forward to Zed (it didn't send the request).
@@ -532,6 +535,29 @@ fn json_id_to_string(id: Option<&Value>) -> Option<String> {
         Value::Number(n) => Some(n.to_string()),
         _ => None,
     }
+}
+
+/// Log a JSON-RPC frame's shape (method + id + kind) at TRACE level.
+fn trace_frame(arrow: &str, v: &Value) {
+    let method = v.get("method").and_then(|m| m.as_str());
+    let id = v.get("id").map(|i| i.to_string());
+    let kind = if v.get("method").is_some() {
+        if v.get("id").is_some() { "request" } else { "notif" }
+    } else if v.get("result").is_some() {
+        "response"
+    } else if v.get("error").is_some() {
+        "error"
+    } else {
+        "?"
+    };
+    let preview = match v.get("params").or_else(|| v.get("result")).or_else(|| v.get("error")) {
+        Some(p) => truncate(&p.to_string(), 240),
+        None => String::new(),
+    };
+    trace!(
+        target: "alzed_bridge::wire",
+        "{arrow} {kind:8} id={id:?} method={method:?} payload={preview}"
+    );
 }
 
 fn is_method(body: &[u8], method: &str) -> bool {
