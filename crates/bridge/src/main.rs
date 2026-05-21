@@ -32,7 +32,12 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, trace, warn};
 
 const ENV_AL_SERVER: &str = "ALZED_AL_SERVER";
-const BRIDGE_ID_PREFIX: &str = "alzed-bridge:";
+
+/// Starting numeric ID for bridge-initiated requests. The MS AL server parses
+/// JSON-RPC IDs as Int32 (despite the spec allowing strings) and crashes on
+/// non-numeric IDs. We sit high in the i32 range, well past anything Zed will
+/// produce, so collisions are effectively impossible.
+const BRIDGE_ID_BASE: u64 = 900_000_000;
 
 struct Config {
     al_server_path: PathBuf,
@@ -114,10 +119,10 @@ struct Session {
 }
 
 impl Session {
-    fn alloc_id(&mut self, method: &str) -> String {
+    fn alloc_id(&mut self, method: &str) -> u64 {
+        let id = BRIDGE_ID_BASE + self.next_bridge_id;
         self.next_bridge_id += 1;
-        let id = format!("{BRIDGE_ID_PREFIX}{}", self.next_bridge_id);
-        self.bridge_inflight.insert(id.clone(), method.to_string());
+        self.bridge_inflight.insert(id.to_string(), method.to_string());
         id
     }
 }
@@ -276,15 +281,13 @@ async fn server_to_client<R: AsyncRead + Unpin>(
         // Handle responses to bridge-initiated requests — consume locally, never
         // forward to Zed (it didn't send the request).
         if let Some(id_str) = json_id_to_string(v.get("id")) {
-            if id_str.starts_with(BRIDGE_ID_PREFIX) {
-                let mut guard = session.lock().await;
-                let method = guard.bridge_inflight.remove(&id_str);
-                drop(guard);
+            let method = session.lock().await.bridge_inflight.remove(&id_str);
+            if let Some(method) = method {
                 if let Some(err) = v.get("error") {
-                    warn!(method = ?method, error = %err, "bridge request failed");
+                    warn!(method = %method, error = %err, "bridge request failed");
                 } else {
                     debug!(
-                        method = ?method,
+                        method = %method,
                         result = %truncate(&v.get("result").map(|r| r.to_string()).unwrap_or_default(), 200),
                         "bridge request ok"
                     );
@@ -460,7 +463,7 @@ async fn run_handshake(
 
         info!(
             project = %project_path.display(),
-            id = %id,
+            id,
             "sending al/loadManifest"
         );
 
