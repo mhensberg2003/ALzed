@@ -3,48 +3,84 @@
 AL language support for [Zed](https://zed.dev) — targeting feature parity with the
 Microsoft VS Code AL extension for Dynamics 365 Business Central.
 
-## Status: v0.1 (early)
+## Status
 
 | Feature | Status |
 |---|---|
 | Syntax highlighting | working (tree-sitter-al) |
-| Indentation | working |
 | File association (`.al`, `.dal`) | working |
-| LSP — diagnostics / IntelliSense / hover / go-to-def | wired, requires binary (see below) |
+| LSP transport (server starts) | working |
+| Diagnostics / IntelliSense / hover / go-to-def | **blocked on protocol bridge** — see below |
 | Symbols / outline | planned |
 | Snippets | planned |
 | Build / publish / debug commands | planned |
-| Symbol package management (`.app` files) | planned |
+
+## Why the bridge
+
+The Microsoft AL Language Server (`Microsoft.Dynamics.Nav.EditorServices.Host`)
+does **not** speak vanilla LSP for the features that matter. It exposes a
+custom `al/*` protocol — for example, IntelliSense uses `al/completions`
+instead of `textDocument/completion`, and the server is inert until it
+receives an `al/loadManifest` request per workspace folder.
+
+The VS Code AL extension ships a TypeScript shim that performs this
+translation. Zed cannot do it natively, so ALzed includes a small Rust process
+— **`alzed-bridge`** — that sits between Zed and the AL Language Server and
+translates the protocols.
+
+See [docs/al-protocol.md](docs/al-protocol.md) for the custom method inventory
+and translation plan.
+
+## Repo layout
+
+```
+ALzed/
+├── crates/
+│   ├── extension/      Zed extension (compiled to wasm32-wasip2, loaded by Zed)
+│   └── bridge/         alzed-bridge — native binary, runs on the host
+├── docs/
+│   └── al-protocol.md  Reverse-engineered AL custom LSP protocol notes
+└── README.md
+```
 
 ## Installation (dev)
 
 ```sh
-git clone <this repo> ALzed
+git clone https://github.com/mhensberg2003/ALzed.git
 cd ALzed
 rustup target add wasm32-wasip2
+
+# Build the bridge for your host:
+cargo build --release --manifest-path crates/bridge/Cargo.toml
 ```
 
-Then in Zed: `cmd-shift-p` → **"zed: install dev extension"** → pick this directory.
+Then in Zed: `Ctrl+Shift+P` → **"zed: install dev extension"** → pick
+**`crates/extension`** (not the repo root).
 
 ## Configuring the AL Language Server
 
-The Microsoft AL Language Server is closed-source and ships inside the official
+The MS AL Language Server is closed-source and ships inside the official
 VS Code AL extension (`ms-dynamics-smb.al`). ALzed does not redistribute it.
 
-Locate the binary on your machine — typically:
+Typical paths after installing the VS Code AL extension:
 
 - **Windows**: `%USERPROFILE%\.vscode\extensions\ms-dynamics-smb.al-<version>\bin\win32\Microsoft.Dynamics.Nav.EditorServices.Host.exe`
 - **macOS**: `~/.vscode/extensions/ms-dynamics-smb.al-<version>/bin/darwin/Microsoft.Dynamics.Nav.EditorServices.Host`
 - **Linux**: `~/.vscode/extensions/ms-dynamics-smb.al-<version>/bin/linux/Microsoft.Dynamics.Nav.EditorServices.Host`
 
-Then point Zed at it. Open `~/.config/zed/settings.json`:
+In your Zed `settings.json`, point Zed at **`alzed-bridge`** and pass the AL
+server path through it:
 
 ```jsonc
 {
   "lsp": {
     "al": {
       "binary": {
-        "path": "/absolute/path/to/Microsoft.Dynamics.Nav.EditorServices.Host"
+        "path": "/absolute/path/to/target/release/alzed-bridge",
+        "arguments": [
+          "--al-server",
+          "C:\\Users\\you\\.vscode\\extensions\\ms-dynamics-smb.al-17.0.2273547\\bin\\win32\\Microsoft.Dynamics.Nav.EditorServices.Host.exe"
+        ]
       },
       "settings": {
         "packageCachePath": "./.alpackages",
@@ -55,17 +91,10 @@ Then point Zed at it. Open `~/.config/zed/settings.json`:
 }
 ```
 
-Alternatively export `AL_LANGUAGE_SERVER_PATH` in your shell.
+Alternatively set `ALZED_AL_SERVER` in your environment instead of passing
+`--al-server`.
 
-## Architecture
-
-- **Grammar**: [`SShadowS/tree-sitter-al`](https://github.com/SShadowS/tree-sitter-al)
-  pinned by commit. Fetched at install time by Zed.
-- **Language server**: wraps Microsoft's `Microsoft.Dynamics.Nav.EditorServices.Host`
-  over stdio LSP.
-- **Settings**: surfaced under the `al` namespace via `workspace/configuration` so
-  the MS server picks up `packageCachePath`, `codeAnalyzers`, `enableCodeAnalysis`,
-  `ruleSetPath`, etc. exactly as it would in VS Code.
+To see every LSP frame the bridge handles, set `RUST_LOG=alzed_bridge=trace`.
 
 ## License
 
