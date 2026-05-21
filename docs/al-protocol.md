@@ -1,149 +1,234 @@
 # Microsoft AL Language Server — Custom Protocol
 
 The MS AL Language Server (`Microsoft.Dynamics.Nav.EditorServices.Host`) speaks
-a superset of LSP. For most features it exposes proprietary `al/*` methods
-instead of (or in addition to) the standard LSP equivalents.
+**standard LSP** for editor features — hover, completion, definition, code
+actions, formatting, document symbols, etc. all go through vanilla request
+types from `vscode-languageserver-protocol`.
+
+What's custom is everything **beyond** standard LSP: workspace activation,
+symbol package management, code generation, debugger, AL-specific commands.
+These live under the `al/*` namespace.
+
+The catch: the server is **inert** until the client registers each workspace's
+`app.json` via `al/loadManifest`. Until then, standard LSP requests return
+empty responses — looking from the outside like a broken server.
 
 This document captures what we learn by inspecting the bundled JS client in
-`ms-dynamics-smb.al/dist/extension.js`. It is the spec we implement against in
-`crates/bridge`.
+`ms-dynamics-smb.al/dist/extension.js`. It is the spec the bridge implements.
 
 ## Source of truth
 
-- VS Code AL extension: `ms-dynamics-smb.al` (proprietary, but the JS client is
-  shipped readable inside the VSIX/installed extension folder).
-- Inspected version at time of writing: **17.0.2273547**.
-- Path on disk:
-  `~/.vscode/extensions/ms-dynamics-smb.al-17.0.2273547/dist/extension.js`
+- VS Code AL extension: `ms-dynamics-smb.al` (proprietary; the JS client is
+  shipped readable inside the installed extension folder).
+- Inspected version: **17.0.2273547**.
 
-## Method inventory (incomplete — populate as we map each one)
+## The activation handshake
 
-The methods below were extracted by grepping for `"al/...":` and
-`sendRequest("al/...")` patterns in the bundle. **TODO** for each: capture the
-exact request params shape and response shape from the JS bundle and add a
-TypeScript-style signature.
+This is what the VS Code TypeScript shim does that Zed cannot. Without it the
+server stays idle.
+
+```text
+1. LSP initialize / initialized            (standard)
+2. For each workspace folder F:
+     read F/app.json
+     client -> server  al/loadManifest  { projectFolder: F, manifest: <text of app.json> }
+     server -> client  { success: true, manifest: <processed-manifest-json> }
+3. Server eventually -> client  al/activeProjectLoaded  { activeProjectFolder: <uri> }
+4. Server begins analysis. Standard LSP requests now return real results.
+```
+
+Evidence from the bundle (de-minified excerpt):
+
+```js
+// Path: function reading app.json then registering with the server
+const text = (await workspace.openTextDocument(projectFileUri))?.getText();
+const params = { projectFolder: path.dirname(projectFileUri.fsPath), manifest: text };
+const result = await client.sendRequest(AlLoadManifestRequest, params);
+if (result.success) {
+  return Manifest.parse(result.manifest);
+}
+
+// Readiness notification handler
+client.onRequest(AlActiveProjectLoaded, async (e) => {
+  const folder = workspace.getWorkspaceFolder(Uri.parse(e.activeProjectFolder));
+  if (folder) await this.loadProjectReferences(folder, new Set());
+});
+```
+
+### `al/loadManifest`
+
+**Request params:**
+```ts
+{
+  projectFolder: string;  // absolute path to the project folder (the dir containing app.json)
+  manifest: string;       // raw text of app.json
+}
+```
+
+**Response:**
+```ts
+{
+  success: boolean;
+  manifest: string;       // server-processed manifest JSON (may add resolved fields)
+}
+```
+
+### `al/activeProjectLoaded` (server → client)
+
+Sent by the server when it has finished loading a project's symbol closure.
+After this fires, standard LSP requests for that project return real results.
+
+```ts
+{ activeProjectFolder: string }  // file:// URI
+```
+
+### `al/didChangeWorkspaceFolders` (client → server, notification)
+
+Standard `workspace/didChangeWorkspaceFolders` is **not** what AL listens to.
+Mirror folder changes here with the same `{ added, removed }` shape.
+
+### `al/didChangeActiveDocument` (client → server, notification)
+
+Tells the server which document is focused so it can prioritize analysis. The
+bundle calls this on VS Code's `onDidChangeActiveTextEditor`.
+
+```ts
+{ uri: string }
+```
+
+## Response quirks
+
+**Empty hover.** The MS server returns `{}` (empty object) when no hover info
+is available at a position. The LSP spec says return `null`. Zed's strict
+deserializer rejects `{}` with `missing field 'contents'`. The bridge must
+rewrite `{}` → `null` in hover responses.
+
+This may apply to other "optional Hover-like" responses too. Watch for it in
+trace logs and add normalizers as we hit them.
+
+## Standard LSP requests the AL server handles
+
+These are sent unchanged through the bridge; once `al/loadManifest` is done,
+they return real data.
+
+- `textDocument/hover`
+- `textDocument/completion` (and `completionItem/resolve`)
+- `textDocument/definition`, `declaration`, `typeDefinition`, `implementation`
+- `textDocument/references`
+- `textDocument/documentHighlight`
+- `textDocument/documentSymbol`
+- `textDocument/formatting`, `rangeFormatting`, `onTypeFormatting`
+- `textDocument/codeAction`, `codeAction/resolve`
+- `textDocument/codeLens`, `codeLens/resolve`
+- `textDocument/signatureHelp`
+- `textDocument/documentLink`, `documentLink/resolve`
+- `textDocument/documentColor`, `colorPresentation`
+- `textDocument/callHierarchy/*`
+- `workspace/symbol`
+- `workspace/executeCommand`
+
+`textDocument/publishDiagnostics` arrives as a server→client notification
+(standard) and should reach Zed unchanged.
+
+## `al/*` method inventory (commands, not editor features)
+
+These are custom features beyond LSP. Bridge can pass them through or expose
+as Zed slash-commands later.
 
 ### Lifecycle / workspace
-
-| Method | Kind | Notes |
-|---|---|---|
-| `al/loadManifest` | request | Tells the server about an `app.json`. Must be called per workspace folder before the server will analyze anything. **Init handshake critical.** |
-| `al/didChangeWorkspaceFolders` | notification (?) | Replaces standard `workspace/didChangeWorkspaceFolders` for AL. |
-| `al/didChangeActiveDocument` | notification | Tells the server which document is focused — feeds the "active project" concept. |
-| `al/activeProjectLoaded` | notification (server→client) | Server signals it has loaded a project. |
-| `al/manifestMissing` | notification (server→client?) | Server signals a missing `app.json`. |
-| `al/hasProjectClosureLoadedRequest` | request | Probe — has the project's dependency closure been loaded? |
-
-### IntelliSense (replaces vanilla LSP methods)
-
-| Method | Kind | Replaces |
-|---|---|---|
-| `al/completions` | request | `textDocument/completion` |
-| `al/gotodefinition` | request | `textDocument/definition` |
-
-(Hover appears to use vanilla `textDocument/hover` but the server returns `{}`
-instead of `null` when no info — we'll need a small response normalizer.)
+- `al/loadManifest` (critical — see above)
+- `al/didChangeWorkspaceFolders`
+- `al/didChangeActiveDocument`
+- `al/activeProjectLoaded` (server → client)
+- `al/manifestMissing` (server → client)
+- `al/hasProjectClosureLoadedRequest`
+- `al/progressNotification` (server → client)
+- `al/projectsLoadedNotification` (server → client)
 
 ### Symbols / packages
-
-| Method | Notes |
-|---|---|
-| `al/checkSymbols` | Validates `.alpackages` cache integrity. |
-| `al/downloadSymbols` | Pulls `.app` symbol files from configured BC server. |
-| `al/downloadSymbolsFromGlobalSources` | Variant pulling from public symbol feeds. |
-| `al/getPackageDependencies` | Returns dependency graph for the loaded app. |
-| `al/createPackage` | Build / packaging command. |
+- `al/checkSymbols`
+- `al/downloadSymbols`
+- `al/downloadSymbolsFromGlobalSources`
+- `al/getPackageDependencies`
+- `al/createPackage`
+- `al/fullDependencyPublish`
+- `al/downloadSource`
+- `al/publish`
+- `al/symbolSearchRequest`
 
 ### Application object queries
+- `al/getApiPages`
+- `al/getApplicationObject`
+- `al/getApplicationObjects`
+- `al/getExtensibleEnums`
+- `al/getEventPublishersRequest`
+- `al/getListOfPermissionSets`
+- `al/getWorkflowChain`
 
-| Method | Notes |
-|---|---|
-| `al/getApiPages` | Lists API page objects. |
-| `al/getApplicationObject` | Get a single object by id/type. |
-| `al/getApplicationObjects` | List objects. |
-| `al/getExtensibleEnums` | Used for enum extension scaffolding. |
-| `al/getEventPublishersRequest` | Used for event subscriber scaffolding. |
-| `al/getListOfPermissionSets` | Permission set enumeration. |
-| `al/getWorkflowChain` | Workflow definitions. |
-
-### Code generation / commands
-
-| Method | Notes |
-|---|---|
-| `al/generatePermissionSet` | Generates `.permissionset.al`. |
-| `al/generatePermissionSetInALObject` | Inline permission scaffolding. |
-| `al/getErrorTemplate` | Error template generation. |
-| `al/openPageDesigner` | Launches Page Designer UI (likely returns a URI for client to open). |
-| `al/openEventRecorder` | Launches Event Recorder UI. |
-| `al/openUri` | Generic URI open delegate. |
+### Codegen / commands
+- `al/generatePermissionSet`
+- `al/generatePermissionSetInALObject`
+- `al/getErrorTemplate`
+- `al/openPageDesigner`
+- `al/openEventRecorder`
+- `al/openUri`
+- `al/runObject`
+- `al/refreshObjectsEvent`
+- `al/setSymbolMembers`
+- `al/setSymbolProperty`
 
 ### Debugger
-
-| Method | Notes |
-|---|---|
-| `al/debuggerConsoleCompletionRequest` | Completions in debug REPL. |
-| `al/initializeSnapshotDebuggerAttach` | Snapshot debugger attach. |
-| `al/finishSnapshotDebuggerSessionRequest` | Snapshot session teardown. |
-| `al/generatecpuprofile` | CPU profile generation. |
+- `al/debuggerConsoleCompletionRequest`
+- `al/completions` (**debugger console** completions — NOT regular completion)
+- `al/provideCompletions` (debugger)
+- `al/initializeSnapshotDebuggerAttach`
+- `al/finishSnapshotDebuggerSessionRequest`
+- `al/generatecpuprofile`
 
 ### Auth
-
-| Method | Notes |
-|---|---|
-| `al/checkAuthenticated` | OAuth state check. |
-| `al/clearCredentialsCache` | Clear cached token. |
-| `al/deviceLogin` | Device-code login flow. |
-| `al/launchDeviceLoginWindow` | Client should open browser for OAuth. |
+- `al/checkAuthenticated`
+- `al/clearCredentialsCache`
+- `al/deviceLogin`
+- `al/launchDeviceLoginWindow`
 
 ### Testing
-
-| Method | Notes |
-|---|---|
-| `al/discoverTests` | Enumerate test codeunits. |
+- `al/discoverTests`
 
 ### Telemetry
+- `al/didChangeTelemetrySettings`
+- `al/getTelemetrySettings`
+- `al/getNstSessionInfo`
 
-| Method | Notes |
-|---|---|
-| `al/didChangeTelemetrySettings` | Pushes user telemetry prefs. |
-| `al/getTelemetrySettings` | Pull current settings. |
-| `al/getNstSessionInfo` | NST diagnostics. |
+## Bridge implementation priority
 
-### Publish / deploy
+In rough order of value-to-effort:
 
-| Method | Notes |
-|---|---|
-| `al/fullDependencyPublish` | Publish app + dependencies to a BC server. |
-| `al/downloadSource` | Download source for a published app. |
-
-## Implementation priority (drives bridge work)
-
-1. **`al/loadManifest`** — without this, the server is inert. Bridge must call
-   it for each workspace folder once standard `initialize`/`initialized`
-   completes.
-2. **`al/didChangeWorkspaceFolders`** — keep the server in sync as folders are
-   added/removed.
-3. **Hover `{}` normalization** — translate empty `{}` hover responses to
-   `null` so Zed's deserializer doesn't error.
-4. **`textDocument/completion` -> `al/completions`** — request and response
-   translation. Highest user-value standard feature.
-5. **`textDocument/definition` -> `al/gotodefinition`** — same.
-6. **`al/didChangeActiveDocument`** — wire to Zed's active-buffer changes so
-   the server can prioritize analysis.
-7. **`al/checkSymbols`** at init — surfaces missing-symbol warnings early.
-
-The rest (codegen, debugger, auth, telemetry) become commands or are wired in
-later phases.
+1. ✅ Stdio passthrough with frame tracing (done in v0.1).
+2. **AL init handshake** — open each workspace's `app.json`, send
+   `al/loadManifest` after standard `initialized`. Watch for
+   `al/activeProjectLoaded`. **This alone is expected to unblock diagnostics,
+   hover, completion, definition** — the headline parity features.
+3. **`{}` hover normalizer** — rewrite empty-object responses to `null`.
+4. **`al/didChangeWorkspaceFolders` mirror** — when standard
+   `workspace/didChangeWorkspaceFolders` arrives, also send the AL variant.
+5. **`al/didChangeActiveDocument` push** — driven by something Zed exposes
+   (initial open / didOpen of `.al` files).
+6. Filter unknown notifications (`al/progressNotification` etc.) to
+   `window/logMessage` so Zed sees server progress and doesn't error.
+7. Commands (codegen, downloadSymbols) — exposed as Zed extension
+   slash-commands later.
 
 ## Open questions
 
-- Are `al/loadManifest` params just `{ uri: string }` or does the server want
-  the parsed manifest contents?
-- Does the server send `al/activeProjectLoaded` *before* it'll respond to any
-  IntelliSense request? If yes, the bridge should treat it as a readiness gate
-  and buffer client requests until it fires.
-- Does `al/completions` accept the same params shape as
-  `textDocument/completion` or does it use a custom shape?
+- Does `al/loadManifest` need the full manifest text every time, or just the
+  URI? (Bundle clearly passes full text — go with that.)
+- Does the server send custom `window/logMessage` traffic we should keep, or
+  noisy notifications we should drop?
+- Are diagnostics scoped per-project — i.e., do we have to send
+  `al/loadManifest` again after VS Code/Zed reopens?
+- How does workspace folder removal interact with `al/loadManifest`? Is there
+  a corresponding `al/unloadManifest` or does `al/didChangeWorkspaceFolders`
+  cover it? (Need to find the unload path in the bundle.)
 
-Each becomes a tracing experiment once the passthrough bridge is running and we
-can observe a real session.
+Each becomes a quick experiment once the bridge is running against a real
+session.
