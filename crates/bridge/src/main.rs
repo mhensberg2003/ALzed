@@ -649,10 +649,71 @@ fn inject_code_actions(v: &Value, original: &[u8], uri: Option<&str>) -> Result<
 
 fn spawn_handshake(session: Arc<Mutex<Session>>, to_server: mpsc::Sender<Vec<u8>>) {
     tokio::spawn(async move {
-        if let Err(e) = run_handshake(session, to_server).await {
+        if let Err(e) = run_handshake(session.clone(), to_server.clone()).await {
             error!(error = %e, "AL handshake failed");
         }
+        spawn_trigger_watcher(session, to_server);
     });
+}
+
+/// Watch each workspace folder for `.alzed-trigger.txt`. When the file
+/// appears, its trimmed contents are treated as a command name (e.g.
+/// `download-symbols`, `check-symbols`) and dispatched. The file is removed
+/// immediately so a command fires exactly once.
+///
+/// This exists primarily so Zed *tasks* (defined in ~/.config/zed/tasks.json)
+/// can invoke alzed commands via the command palette — tasks can only run
+/// shell commands, so they touch this file and the bridge does the rest.
+fn spawn_trigger_watcher(session: Arc<Mutex<Session>>, to_server: mpsc::Sender<Vec<u8>>) {
+    tokio::spawn(async move {
+        let folders = session.lock().await.workspace_folders.clone();
+        let paths: Vec<PathBuf> = folders
+            .iter()
+            .filter_map(|f| uri_to_path(&f.uri))
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        info!(
+            count = paths.len(),
+            "watching .alzed-trigger.txt in each workspace folder"
+        );
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            for folder in &paths {
+                let trigger = folder.join(".alzed-trigger.txt");
+                let content = match tokio::fs::read_to_string(&trigger).await {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let _ = tokio::fs::remove_file(&trigger).await;
+                let cmd = content.trim().to_string();
+                info!(folder = %folder.display(), command = %cmd, "trigger file detected");
+                if let Err(e) = dispatch_trigger(&cmd, folder, &session, &to_server).await {
+                    warn!(command = %cmd, error = %e, "trigger command failed");
+                }
+            }
+        }
+    });
+}
+
+async fn dispatch_trigger(
+    cmd: &str,
+    folder: &std::path::Path,
+    session: &Arc<Mutex<Session>>,
+    to_server: &mpsc::Sender<Vec<u8>>,
+) -> Result<()> {
+    match cmd {
+        "download-symbols" => trigger_download_symbols(folder, session, to_server).await,
+        "check-symbols" => trigger_check_symbols(session, to_server).await,
+        other => {
+            warn!(
+                command = other,
+                "unknown trigger command — supported: download-symbols, check-symbols"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Handle our injected commands locally. The bridge never forwards them to

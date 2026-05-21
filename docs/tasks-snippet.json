@@ -1,0 +1,34 @@
+// Paste these entries into ~/.config/zed/tasks.json (or %APPDATA%\Zed\tasks.json
+// on Windows) to get "AL: Download symbols" and "AL: Check symbols" in Zed's
+// command palette under `task: spawn` — globally available in every project.
+//
+// How it works:
+//   1. You pick the task from the palette.
+//   2. Zed runs the task in your project root (cwd).
+//   3. The task writes a one-line command into .alzed-trigger.txt.
+//   4. The bridge (alzed-bridge.exe) is watching that file. It picks up the
+//      command, fires the corresponding al/* request to the AL Language
+//      Server, and deletes the trigger file.
+//
+// The bridge must be running for these to do anything — which it is whenever
+// you have an AL workspace open in Zed.
+[
+  {
+    "label": "AL: Download symbols",
+    "command": "powershell",
+    "args": ["-NoProfile", "-Command", "Set-Content -Path .alzed-trigger.txt -Value 'download-symbols'"],
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "never",
+    "tags": ["al"]
+  },
+  {
+    "label": "AL: Check symbols",
+    "command": "powershell",
+    "args": ["-NoProfile", "-Command", "Set-Content -Path .alzed-trigger.txt -Value 'check-symbols'"],
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "never",
+    "tags": ["al"]
+  }
+]
