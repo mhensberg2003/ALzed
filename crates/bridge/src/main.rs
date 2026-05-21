@@ -494,7 +494,7 @@ async fn run_handshake(
         return Ok(());
     }
 
-    for folder in folders {
+    for (index, folder) in folders.into_iter().enumerate() {
         let project_path = match uri_to_path(&folder.uri) {
             Some(p) => p,
             None => {
@@ -537,25 +537,55 @@ async fn run_handshake(
         let body = serde_json::to_vec(&request)?;
         to_server.send(frame(&body)).await?;
 
-        // After loadManifest, push a workspace/didChangeConfiguration with
-        // flat AL settings so the server starts analyzing. (Zed's automatic
-        // didChangeConfiguration is also rewritten by the client pump, but we
-        // re-send here in case ours arrives first.)
+        // 1) workspace/didChangeConfiguration (flat) — give the server its
+        //    AL settings. Belt and braces alongside the client-pump's
+        //    rewriting of Zed's automatic config push.
         let package_cache_path = project_path
             .join(".alpackages")
             .to_string_lossy()
             .into_owned();
+        let settings = default_al_settings(&package_cache_path);
+
         let notification = json!({
             "jsonrpc": "2.0",
             "method": "workspace/didChangeConfiguration",
-            "params": { "settings": default_al_settings(&package_cache_path) }
+            "params": { "settings": settings.clone() }
         });
         info!(
             project = %project_path.display(),
             "sending workspace/didChangeConfiguration (flat settings)"
         );
-        let body = serde_json::to_vec(&notification)?;
-        to_server.send(frame(&body)).await?;
+        to_server
+            .send(frame(&serde_json::to_vec(&notification)?))
+            .await?;
+
+        // 2) al/setActiveWorkspace — THE trigger that makes the AL server
+        //    actually start analyzing. The VS Code extension calls this for
+        //    the active workspace folder right after loading the manifest;
+        //    without it, the server stays idle and every editor request
+        //    returns empty.
+        let active_id = session.lock().await.alloc_id("al/setActiveWorkspace");
+        let active_request = json!({
+            "jsonrpc": "2.0",
+            "id": active_id,
+            "method": "al/setActiveWorkspace",
+            "params": {
+                "currentWorkspaceFolderPath": {
+                    "uri": folder.uri,
+                    "name": folder.name,
+                    "index": index,
+                },
+                "settings": settings,
+            }
+        });
+        info!(
+            project = %project_path.display(),
+            id = active_id,
+            "sending al/setActiveWorkspace"
+        );
+        to_server
+            .send(frame(&serde_json::to_vec(&active_request)?))
+            .await?;
     }
 
     Ok(())
