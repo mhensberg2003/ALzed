@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-bridge:
+    name: Build bridge (linux-x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/bridge/target
+          key: ${{ runner.os }}-cargo-ci-${{ hashFiles('crates/bridge/Cargo.lock') }}
+      - name: cargo build
+        working-directory: crates/bridge
+        run: cargo build --release
+      - name: cargo clippy
+        working-directory: crates/bridge
+        run: cargo clippy --release --no-deps

@@ -81,9 +81,37 @@ ALzed/
 
 ALzed has two parts that need to be set up separately: the **Zed
 extension** (loaded as a dev extension) and the **bridge binary**
-(compiled native, runs alongside Zed).
+(native, runs alongside Zed). There are two install paths — pick one:
 
-### 1. Prerequisites
+- **[Prebuilt (recommended)](#install-from-prebuilt-release)**: download
+  the bridge and extension tarball from the latest
+  [GitHub Release](https://github.com/mhensberg2003/ALzed/releases).
+- **[Build from source](#install-by-building-from-source)**: clone the
+  repo and `cargo build`. Useful if you want to hack on ALzed itself or
+  a release for your platform isn't published yet.
+
+### Install from prebuilt release
+
+1. Go to <https://github.com/mhensberg2003/ALzed/releases/latest>.
+2. Download the bridge binary for your OS:
+   - `alzed-bridge-windows-x86_64.exe`
+   - `alzed-bridge-linux-x86_64`
+   - `alzed-bridge-macos-arm64`
+   - `alzed-bridge-macos-x86_64`
+3. Move it to a stable path you'll reference later, e.g.
+   `C:\Users\you\bin\alzed-bridge.exe` or `~/bin/alzed-bridge`.
+   On macOS/Linux, mark it executable: `chmod +x ~/bin/alzed-bridge`.
+4. Download `alzed-zed-extension.tar.gz` from the same release and
+   extract it somewhere stable (e.g. `~/zed-extensions/al/`). You should
+   see an `extension.toml` at the root of the extracted folder.
+5. In Zed: `Ctrl+Shift+P` → **"zed: install dev extension"** → pick
+   the extracted folder.
+6. Continue to [Locate the AL Language Server](#locate-the-al-language-server)
+   then [Wire it together in `settings.json`](#wire-it-together-in-settingsjson).
+
+### Install by building from source
+
+#### 1. Prerequisites
 
 - Rust toolchain (`rustup`).
 - `wasm32-wasip2` target: `rustup target add wasm32-wasip2`.
@@ -93,7 +121,7 @@ extension** (loaded as a dev extension) and the **bridge binary**
   `x86_64-pc-windows-gnu`: `sudo apt install mingw-w64` and
   `rustup target add x86_64-pc-windows-gnu`.
 
-### 2. Build the bridge
+#### 2. Build the bridge
 
 The bridge needs to be compiled for the OS where Zed runs (where the AL
 server runs is the same OS in practice).
@@ -124,7 +152,7 @@ Copy the resulting binary to a stable path (e.g. `~/bin/alzed-bridge`
 or `C:\Users\you\bin\alzed-bridge.exe`) so you can reference it from
 `settings.json`.
 
-### 3. Install the Zed extension
+#### 3. Install the Zed extension
 
 In Zed: `Ctrl+Shift+P` → **"zed: install dev extension"** → pick the
 `crates/extension` directory (not the repo root).
@@ -133,7 +161,7 @@ In Zed: `Ctrl+Shift+P` → **"zed: install dev extension"** → pick the
 > (`C:\Users\you\ALzed\crates\extension`). UNC paths like
 > `\\wsl.localhost\Ubuntu\...` cause the dev-extension build to fail.
 
-### 4. Locate the AL Language Server
+### Locate the AL Language Server
 
 After installing the VS Code AL extension, the server lives at:
 
@@ -141,7 +169,7 @@ After installing the VS Code AL extension, the server lives at:
 - **macOS**: `~/.vscode/extensions/ms-dynamics-smb.al-<version>/bin/darwin/Microsoft.Dynamics.Nav.EditorServices.Host`
 - **Linux**: `~/.vscode/extensions/ms-dynamics-smb.al-<version>/bin/linux/Microsoft.Dynamics.Nav.EditorServices.Host`
 
-### 5. Wire it together in `settings.json`
+### Wire it together in `settings.json`
 
 ```jsonc
 {

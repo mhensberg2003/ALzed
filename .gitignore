@@ -1,6 +1,8 @@
 /target
 **/target
 **/Cargo.lock
+# alzed-bridge is a binary — track its lock file for reproducible builds.
+!crates/bridge/Cargo.lock
 /grammars
 *.wasm
 .DS_Store
