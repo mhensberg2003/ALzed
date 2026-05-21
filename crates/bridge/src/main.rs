@@ -469,8 +469,52 @@ async fn run_handshake(
 
         let body = serde_json::to_vec(&request)?;
         to_server.send(frame(&body)).await?;
+
+        // After loadManifest, push a workspace/didChangeConfiguration so the
+        // AL server actually starts analyzing. The VS Code extension does this
+        // via sendConfigurationChange after a manifest is loaded. Without it
+        // the server has the manifest but no config, and stays idle.
+        send_did_change_configuration(&project_path, &to_server).await?;
     }
 
+    Ok(())
+}
+
+async fn send_did_change_configuration(
+    project_path: &std::path::Path,
+    to_server: &mpsc::Sender<Vec<u8>>,
+) -> Result<()> {
+    let package_cache_path = project_path
+        .join(".alpackages")
+        .to_string_lossy()
+        .into_owned();
+
+    let notification = json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeConfiguration",
+        "params": {
+            "settings": {
+                "al": {
+                    "packageCachePath": package_cache_path,
+                    "enableCodeAnalysis": false,
+                    "backgroundCodeAnalysis": "Project",
+                    "codeAnalyzers": [],
+                    "ruleSetPath": "",
+                    "incrementalBuild": false,
+                    "assemblyProbingPaths": ["./.netpackages"],
+                    "dependencyClosure": [],
+                    "projectReferences": []
+                }
+            }
+        }
+    });
+
+    info!(
+        project = %project_path.display(),
+        "sending workspace/didChangeConfiguration"
+    );
+    let body = serde_json::to_vec(&notification)?;
+    to_server.send(frame(&body)).await?;
     Ok(())
 }
 
