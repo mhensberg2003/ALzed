@@ -807,12 +807,26 @@ async fn trigger_download_symbols(
         .cloned()
         .ok_or_else(|| anyhow!("launch.json has no configurations[]"))?;
 
+    // Params shape from VS Code AL extension's ServerProxy.sendRequest:
+    //   Object.assign({configuration: launchConfig}, getAlParams())
+    // i.e. the launch.json config goes under `configuration`, and AL-level
+    // params (browser/env/symbol feeds + force) are merged alongside.
+    let params = json!({
+        "configuration": config,
+        "browserInfo": { "browser": null, "incognito": false },
+        "environmentInfo": { "env": null },
+        "symbolsCountryRegion": null,
+        "nugetFeeds": [],
+        "useOnlyCustomFeeds": false,
+        "force": false,
+    });
+
     let id = session.lock().await.alloc_id("al/downloadSymbols");
     let request = json!({
         "jsonrpc": "2.0",
         "id": id,
         "method": "al/downloadSymbols",
-        "params": config,
+        "params": params,
     });
     info!(
         config_name = config.get("name").and_then(|n| n.as_str()).unwrap_or("?"),
