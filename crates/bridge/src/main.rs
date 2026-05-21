@@ -20,6 +20,7 @@
 //!
 //! See `docs/al-protocol.md` for protocol details.
 
+mod progress;
 mod snippets;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -40,6 +41,12 @@ const ENV_AL_SERVER: &str = "ALZED_AL_SERVER";
 /// non-numeric IDs. We sit high in the i32 range, well past anything Zed will
 /// produce, so collisions are effectively impossible.
 const BRIDGE_ID_BASE: u64 = 900_000_000;
+
+/// Starting ID for requests we send to the *client* (e.g.
+/// `window/workDoneProgress/create`). Disjoint from BRIDGE_ID_BASE so the
+/// client→server pump can tell our progress acks apart from real responses
+/// (and drop them instead of forwarding to the AL server).
+const BRIDGE_TO_CLIENT_ID_BASE: u64 = 950_000_000;
 
 struct Config {
     al_server_path: PathBuf,
@@ -122,6 +129,22 @@ struct Session {
     /// we can log responses meaningfully.
     bridge_inflight: HashMap<String, String>,
     next_bridge_id: u64,
+    /// IDs of requests the bridge has sent *to the client* (currently only
+    /// `window/workDoneProgress/create`). Used by client_to_server to
+    /// recognize and silently consume the responses instead of forwarding
+    /// them to the AL server.
+    bridge_to_client_inflight: std::collections::HashSet<String>,
+    next_bridge_to_client_id: u64,
+    /// Progress token per bridge_inflight request id. When the AL server
+    /// responds we look the token up, send `$/progress` end to the client,
+    /// and drop the entry.
+    progress_tokens: HashMap<String, String>,
+    /// Stable progress token per `al/progressNotification` owner so
+    /// repeated notifications update the same status entry in Zed.
+    owner_tokens: HashMap<String, String>,
+    /// Owner tokens that already saw a `begin` event — used so we send
+    /// `begin` once and `report` thereafter (until `end`).
+    owner_open: std::collections::HashSet<String>,
 }
 
 impl Session {
@@ -129,6 +152,13 @@ impl Session {
         let id = BRIDGE_ID_BASE + self.next_bridge_id;
         self.next_bridge_id += 1;
         self.bridge_inflight.insert(id.to_string(), method.to_string());
+        id
+    }
+
+    fn alloc_client_id(&mut self) -> u64 {
+        let id = BRIDGE_TO_CLIENT_ID_BASE + self.next_bridge_to_client_id;
+        self.next_bridge_to_client_id += 1;
+        self.bridge_to_client_inflight.insert(id.to_string());
         id
     }
 }
@@ -172,6 +202,7 @@ async fn main() -> Result<()> {
     let reader_client = tokio::spawn(client_to_server(
         tokio::io::stdin(),
         to_server_tx.clone(),
+        to_client_tx.clone(),
         session.clone(),
     ));
     let reader_server = tokio::spawn(server_to_client(
@@ -203,7 +234,7 @@ fn init_tracing() {
 }
 
 /// Wrap a JSON-RPC payload in LSP framing.
-fn frame(payload: &[u8]) -> Vec<u8> {
+pub(crate) fn frame(payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(payload.len() + 64);
     out.extend_from_slice(format!("Content-Length: {}\r\n\r\n", payload.len()).as_bytes());
     out.extend_from_slice(payload);
@@ -234,6 +265,7 @@ async fn writer_pump_stdout(mut rx: mpsc::Receiver<Vec<u8>>) -> Result<()> {
 async fn client_to_server<R: AsyncRead + Unpin>(
     mut reader: R,
     to_server: mpsc::Sender<Vec<u8>>,
+    to_client: mpsc::Sender<Vec<u8>>,
     session: Arc<Mutex<Session>>,
 ) -> Result<()> {
     loop {
@@ -253,6 +285,22 @@ async fn client_to_server<R: AsyncRead + Unpin>(
             trace!(target: "alzed_bridge::wire", bytes = body.len(), ">>> non-JSON");
         }
 
+        // Drop client responses to bridge-initiated requests (currently
+        // only window/workDoneProgress/create). The AL server didn't issue
+        // those requests, so it would error on the responses if we
+        // forwarded them.
+        if let Some(v) = &parsed {
+            if v.get("method").is_none() {
+                if let Some(id) = json_id_to_string(v.get("id")) {
+                    let consumed = session.lock().await.bridge_to_client_inflight.remove(&id);
+                    if consumed {
+                        trace!(id, "consumed client response to bridge-initiated request");
+                        continue;
+                    }
+                }
+            }
+        }
+
         // Intercept workspace/executeCommand for our custom commands.
         if let Some(v) = &parsed {
             if is_method_value(v, "workspace/executeCommand") {
@@ -262,7 +310,7 @@ async fn client_to_server<R: AsyncRead + Unpin>(
                     .and_then(|c| c.as_str())
                 {
                     if OUR_COMMANDS.contains(&cmd) {
-                        handle_our_command(v, &session, &to_server).await;
+                        handle_our_command(v, &session, &to_server, &to_client).await;
                         continue;
                     }
                 }
@@ -437,7 +485,12 @@ async fn server_to_client<R: AsyncRead + Unpin>(
         // the outcome to the client via window/showMessage so it's visible in
         // Zed as a notification toast, not just in the bridge log.
         if let Some(id_str) = json_id_to_string(v.get("id")) {
-            let method = session.lock().await.bridge_inflight.remove(&id_str);
+            let (method, progress_token) = {
+                let mut guard = session.lock().await;
+                let method = guard.bridge_inflight.remove(&id_str);
+                let token = guard.progress_tokens.remove(&id_str);
+                (method, token)
+            };
             if let Some(method) = method {
                 if let Some(err) = v.get("error") {
                     warn!(method = %method, error = %err, "bridge request failed");
@@ -451,6 +504,9 @@ async fn server_to_client<R: AsyncRead + Unpin>(
                                 .unwrap_or("see language server log")
                         );
                         emit_show_message(&to_client, 1, &msg).await;
+                    }
+                    if let Some(token) = progress_token.as_ref() {
+                        let _ = progress::end(&to_client, token, Some("failed")).await;
                     }
                 } else {
                     debug!(
@@ -470,6 +526,12 @@ async fn server_to_client<R: AsyncRead + Unpin>(
                             (2, format!("AL: {} reported failure", command_label(&method)))
                         };
                         emit_show_message(&to_client, severity, &body).await;
+                        if let Some(token) = progress_token.as_ref() {
+                            let end_msg = if success { "done" } else { "failed" };
+                            let _ = progress::end(&to_client, token, Some(end_msg)).await;
+                        }
+                    } else if let Some(token) = progress_token.as_ref() {
+                        let _ = progress::end(&to_client, token, None).await;
                     }
                 }
                 continue;
@@ -485,6 +547,10 @@ async fn server_to_client<R: AsyncRead + Unpin>(
                     .and_then(|f| f.as_str())
                     .unwrap_or("<unknown>");
                 info!(folder, "AL server reports project loaded — features should now respond");
+            }
+            if method == "al/progressNotification" {
+                handle_al_progress(&v, &to_client, &session).await;
+                continue;
             }
         }
 
@@ -656,6 +722,17 @@ fn command_label(method: &str) -> &'static str {
     }
 }
 
+/// Same as [`command_label`] but keyed by `alzed.al.*` client command names.
+fn command_label_for_cmd(cmd: &str) -> &'static str {
+    match cmd {
+        CMD_DOWNLOAD_SYMBOLS => "Download symbols",
+        CMD_CHECK_SYMBOLS => "Check symbols",
+        CMD_BUILD => "Build package",
+        CMD_PUBLISH => "Publish",
+        _ => "command",
+    }
+}
+
 /// Emit a server→client `window/showMessage` notification, which Zed renders
 /// as a toast.
 ///
@@ -670,6 +747,72 @@ async fn emit_show_message(to_client: &mpsc::Sender<Vec<u8>>, severity: u8, mess
         let _ = to_client.send(frame(&bytes)).await;
     }
     info!(severity, message, "emitted window/showMessage to client");
+}
+
+/// Translate an `al/progressNotification` from the AL server into a Zed-
+/// visible `$/progress` stream. The MS payload is
+/// `{ owner: string, percent?: number, message?: string, cancel?: bool }`.
+/// We keep one stable token per owner, send `begin` on first sight and
+/// `end` when `percent == 100` or `cancel` is true, with `report` in
+/// between.
+async fn handle_al_progress(
+    v: &Value,
+    to_client: &mpsc::Sender<Vec<u8>>,
+    session: &Arc<Mutex<Session>>,
+) {
+    let params = match v.get("params") {
+        Some(p) => p,
+        None => return,
+    };
+    let owner = params
+        .get("owner")
+        .and_then(|o| o.as_str())
+        .unwrap_or("Unknown")
+        .to_string();
+    let percent = params.get("percent").and_then(|p| p.as_u64()).map(|p| p as u32);
+    let message = params
+        .get("message")
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string());
+    let cancel = params
+        .get("cancel")
+        .and_then(|c| c.as_bool())
+        .unwrap_or(false);
+
+    let (token, was_open) = {
+        let mut guard = session.lock().await;
+        let token = guard
+            .owner_tokens
+            .entry(owner.clone())
+            .or_insert_with(|| format!("alzed.al-progress.{owner}"))
+            .clone();
+        let was_open = guard.owner_open.contains(&owner);
+        (token, was_open)
+    };
+
+    let done = cancel || matches!(percent, Some(100));
+
+    if !was_open {
+        // First sighting of this owner — open the task.
+        let title = match owner.as_str() {
+            "OpenWorkspace" => "AL: loading workspace",
+            "Profiler" => "AL: profiler",
+            other => &format!("AL: {other}"),
+        };
+        let create_id = session.lock().await.alloc_client_id();
+        let _ = progress::create(to_client, create_id, &token).await;
+        let _ = progress::begin(to_client, &token, title, message.as_deref()).await;
+        session.lock().await.owner_open.insert(owner.clone());
+    } else if !done {
+        let _ = progress::report(to_client, &token, percent, message.as_deref()).await;
+    }
+
+    if done {
+        let _ = progress::end(to_client, &token, message.as_deref()).await;
+        let mut guard = session.lock().await;
+        guard.owner_open.remove(&owner);
+        guard.owner_tokens.remove(&owner);
+    }
 }
 
 /// Inject our custom commands and codeLensProvider into the server's
@@ -896,6 +1039,7 @@ async fn handle_our_command(
     req: &Value,
     session: &Arc<Mutex<Session>>,
     _to_server: &mpsc::Sender<Vec<u8>>,
+    to_client: &mpsc::Sender<Vec<u8>>,
 ) {
     let cmd = req
         .get("params")
@@ -930,22 +1074,44 @@ async fn handle_our_command(
         from_uri.or_else(|| folders.first().cloned())
     };
 
-    let result = match cmd {
+    let trigger_result: Result<Option<u64>> = match cmd {
         CMD_DOWNLOAD_SYMBOLS => match folder.as_deref() {
-            Some(f) => trigger_download_symbols(f, session, _to_server).await,
+            Some(f) => trigger_download_symbols(f, session, _to_server).await.map(Some),
             None => Err(anyhow!("no workspace folder resolved for downloadSymbols")),
         },
-        CMD_CHECK_SYMBOLS => trigger_check_symbols(session, _to_server).await,
+        CMD_CHECK_SYMBOLS => trigger_check_symbols(session, _to_server).await.map(Some),
         CMD_BUILD => match folder.as_deref() {
-            Some(f) => trigger_build(f, session, _to_server).await,
+            Some(f) => trigger_build(f, session, _to_server).await.map(Some),
             None => Err(anyhow!("no workspace folder resolved for build")),
         },
         CMD_PUBLISH => match folder.as_deref() {
-            Some(f) => trigger_publish(f, session, _to_server).await,
+            Some(f) => trigger_publish(f, session, _to_server).await.map(Some),
             None => Err(anyhow!("no workspace folder resolved for publish")),
         },
-        _ => Ok(()),
+        _ => Ok(None),
     };
+
+    // Wire $/progress around the request — begin now, end fires from
+    // server_to_client when the AL server's response lands.
+    if let Ok(Some(bridge_id)) = trigger_result.as_ref() {
+        let token = format!("alzed.cmd.{cmd}.{bridge_id}");
+        let create_id = session.lock().await.alloc_client_id();
+        let _ = progress::create(to_client, create_id, &token).await;
+        let _ = progress::begin(
+            to_client,
+            &token,
+            &format!("AL: {}", command_label_for_cmd(cmd)),
+            None,
+        )
+        .await;
+        session
+            .lock()
+            .await
+            .progress_tokens
+            .insert(bridge_id.to_string(), token);
+    }
+
+    let result: Result<()> = trigger_result.map(|_| ());
     if let Err(e) = result {
         warn!(command = cmd, error = %e, "alzed command failed");
     }
@@ -973,7 +1139,7 @@ async fn trigger_download_symbols(
     folder: &std::path::Path,
     session: &Arc<Mutex<Session>>,
     to_server: &mpsc::Sender<Vec<u8>>,
-) -> Result<()> {
+) -> Result<u64> {
     let launch_path = folder.join(".vscode").join("launch.json");
     let launch_text = tokio::fs::read_to_string(&launch_path)
         .await
@@ -1014,13 +1180,13 @@ async fn trigger_download_symbols(
         "sending al/downloadSymbols"
     );
     to_server.send(frame(&serde_json::to_vec(&request)?)).await?;
-    Ok(())
+    Ok(id)
 }
 
 async fn trigger_check_symbols(
     session: &Arc<Mutex<Session>>,
     to_server: &mpsc::Sender<Vec<u8>>,
-) -> Result<()> {
+) -> Result<u64> {
     let id = session.lock().await.alloc_id("al/checkSymbols");
     let request = json!({
         "jsonrpc": "2.0",
@@ -1030,7 +1196,7 @@ async fn trigger_check_symbols(
     });
     info!(id, "sending al/checkSymbols");
     to_server.send(frame(&serde_json::to_vec(&request)?)).await?;
-    Ok(())
+    Ok(id)
 }
 
 /// Default compiler arg list — only the mandatory `-project:"..."` for now.
@@ -1050,7 +1216,7 @@ async fn trigger_build(
     folder: &std::path::Path,
     session: &Arc<Mutex<Session>>,
     to_server: &mpsc::Sender<Vec<u8>>,
-) -> Result<()> {
+) -> Result<u64> {
     let project_dir = folder.to_string_lossy().into_owned();
     let args = default_compiler_args(&project_dir);
 
@@ -1071,7 +1237,7 @@ async fn trigger_build(
     });
     info!(project = %folder.display(), id, "sending al/createPackage");
     to_server.send(frame(&serde_json::to_vec(&request)?)).await?;
-    Ok(())
+    Ok(id)
 }
 
 /// Publish (fullDependencyPublish) — builds the project and pushes the
@@ -1085,7 +1251,7 @@ async fn trigger_publish(
     folder: &std::path::Path,
     session: &Arc<Mutex<Session>>,
     to_server: &mpsc::Sender<Vec<u8>>,
-) -> Result<()> {
+) -> Result<u64> {
     let launch_path = folder.join(".vscode").join("launch.json");
     let launch_text = tokio::fs::read_to_string(&launch_path)
         .await
@@ -1123,7 +1289,7 @@ async fn trigger_publish(
         "sending al/fullDependencyPublish"
     );
     to_server.send(frame(&serde_json::to_vec(&request)?)).await?;
-    Ok(())
+    Ok(id)
 }
 
 /// Parse JSON-with-comments (the format VS Code uses for launch.json,

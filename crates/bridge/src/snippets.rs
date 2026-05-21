@@ -94,6 +94,7 @@ fn build_items() -> Result<Vec<Value>> {
 ///   * `null` (server has no suggestions)
 ///   * an array of CompletionItem
 ///   * a CompletionList object `{ isIncomplete: bool, items: [...] }`
+///
 /// We normalize all three into a CompletionList and prepend our snippets.
 pub fn inject_into_completion(response: &Value) -> Value {
     let snippets = completion_items();
