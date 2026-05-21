@@ -414,6 +414,21 @@ async fn server_to_client<R: AsyncRead + Unpin>(
 
         trace_frame("<<<", &v);
 
+        // Inject AL symbol-management hint diagnostic on app.json so the
+        // project surface has a visible indicator that AL tooling is wired
+        // up. Quick-fix actions on app.json are routed by Zed to the JSON
+        // language server, not us — so the diagnostic's *message* points
+        // users to the .al-file code-action route for the actual click
+        // target. (We do still inject the actions there via the
+        // textDocument/codeAction interceptor.)
+        if is_method_value(&v, "textDocument/publishDiagnostics") {
+            let v = inject_app_json_diagnostic(&v);
+            let bytes = serde_json::to_vec(&v).unwrap_or(body.clone());
+            to_client.send(frame(&bytes)).await?;
+            let _ = &to_server; // keep variable used
+            continue;
+        }
+
         // Handle responses to bridge-initiated requests — consume locally, never
         // forward to Zed (it didn't send the request).
         if let Some(id_str) = json_id_to_string(v.get("id")) {
@@ -611,6 +626,50 @@ fn inject_execute_commands(v: &Value, original: &[u8]) -> Result<Vec<u8>> {
 
     info!("injected alzed commands + codeLensProvider into server capabilities");
     Ok(serde_json::to_vec(&patched)?)
+}
+
+/// On textDocument/publishDiagnostics for app.json, prepend a single
+/// Information-severity diagnostic that surfaces the AL symbol-management
+/// affordance. The server's existing diagnostics for app.json are preserved.
+fn inject_app_json_diagnostic(v: &Value) -> Value {
+    let uri = v
+        .pointer("/params/uri")
+        .and_then(|u| u.as_str())
+        .unwrap_or("");
+    if !uri.to_ascii_lowercase().ends_with("/app.json") {
+        return v.clone();
+    }
+
+    let mut patched = v.clone();
+    let arr = match patched
+        .pointer_mut("/params/diagnostics")
+        .and_then(|d| d.as_array_mut())
+    {
+        Some(a) => a,
+        None => return v.clone(),
+    };
+
+    // De-dup: if our hint is already in the list (e.g. server republished
+    // and we re-injected on top of an earlier injection round-trip), skip.
+    let already_present = arr
+        .iter()
+        .any(|d| d.get("source").and_then(|s| s.as_str()) == Some("alzed"));
+    if already_present {
+        return patched;
+    }
+
+    let hint = json!({
+        "range": {
+            "start": {"line": 0, "character": 0},
+            "end":   {"line": 0, "character": 0},
+        },
+        "severity": 3,
+        "source": "alzed",
+        "code": "AL_SYMBOLS",
+        "message": "AL: symbol management — open any .al file and press Ctrl+. to download or check symbols.",
+    });
+    arr.insert(0, hint);
+    patched
 }
 
 /// Prepend "AL: Download symbols" / "AL: Check symbols" code lenses to the
