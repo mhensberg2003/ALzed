@@ -8,9 +8,7 @@
 AL language support for [Zed](https://zed.dev) — Microsoft Dynamics 365
 Business Central development without leaving your editor of choice.
 
-<!-- Record a ~10s clip (see assets/README.md), drop it at assets/demo.gif,
-     and uncomment the line below. A demo is the single biggest star-converter. -->
-<!-- ![ALzed demo](assets/demo.gif) -->
+![ALzed demo](assets/demo.gif)
 
 
 ALzed gives Zed feature parity with the daily inner loop of the official
