@@ -1,0 +1,69 @@
+name: Bug report
+description: Something in ALzed isn't working
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing! Most ALzed issues come down to the handshake with the
+        MS AL server — the version fields below save a lot of back-and-forth.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+      placeholder: Diagnostics never appear after opening an AL workspace…
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open a folder with app.json
+        2. …
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Linux
+        - WSL → Windows Zed
+    validations:
+      required: true
+  - type: input
+    id: zed-version
+    attributes:
+      label: Zed version
+      placeholder: "e.g. 0.x.x (Zed → About)"
+    validations:
+      required: true
+  - type: input
+    id: al-server-version
+    attributes:
+      label: MS AL Language Server version
+      description: The `ms-dynamics-smb.al-<version>` folder in your VS Code extensions.
+      placeholder: "e.g. 17.0.2273547"
+    validations:
+      required: true
+  - type: input
+    id: install-method
+    attributes:
+      label: Install method
+      placeholder: "Prebuilt release / built from source"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Bridge logs
+      description: |
+        Run with `RUST_LOG=alzed_bridge=debug` (set via the `env` field on the
+        `al` LSP entry in settings.json) and paste relevant output from
+        Zed's LSP log. Redact anything sensitive.
+      render: shell

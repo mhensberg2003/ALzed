@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question / discussion
+    url: https://github.com/mhensberg2003/ALzed/discussions
+    about: For setup help, usage questions, and ideas. (Enable Discussions in repo settings.)
+  - name: Zed editor
+    url: https://zed.dev
+    about: Issues with Zed itself (not the AL extension) belong upstream.

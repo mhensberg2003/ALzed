@@ -1,0 +1,23 @@
+name: Feature request
+description: Suggest a capability for ALzed
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's the problem?
+      description: What can't you do today in your AL/BC workflow inside Zed?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like ALzed to do? Reference the VS Code AL behavior if relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives / workarounds
+      description: Anything you currently do to work around this.
